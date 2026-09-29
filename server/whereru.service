@@ -1,0 +1,25 @@
+# systemd unit for the Whereru server (a single compiled Go binary).
+#
+# Copy to /etc/systemd/system/whereru.service, adjust User/WorkingDirectory
+# if you didn't use the paths from the README, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now whereru
+
+[Unit]
+Description=Whereru location relay server
+After=network.target
+
+[Service]
+Type=simple
+User=whereru
+WorkingDirectory=/opt/whereru
+EnvironmentFile=/etc/whereru/whereru.env
+ExecStart=/opt/whereru/whereru-server
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/whereru/data
+
+[Install]
+WantedBy=multi-user.target
