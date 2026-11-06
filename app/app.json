@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Whereru",
+    "name": "Honey Where Are You?",
     "slug": "whereru",
     "version": "0.9.1",
     "orientation": "portrait",
@@ -8,19 +8,22 @@
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.whereru.app",
+      "bundleIdentifier": "com.joshwg.whereru",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Whereru needs your location to share it with your group.",
-        "NSLocationAlwaysAndWhenInUseUsageDescription": "Whereru shares your location with your group every 5 minutes, even when the app is in the background.",
+        "NSLocationWhenInUseUsageDescription": "Honey Where Are You? needs your location to share it with your group.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Honey Where Are You? shares your location with your group every 5 minutes, even when the app is in the background.",
         "UIBackgroundModes": [
           "location"
         ]
+      },
+      "config": {
+        "usesNonExemptEncryption": false
       }
     },
     "android": {
       "package": "com.whereru.app",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#F2EFE6",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -47,11 +50,15 @@
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Whereru shares your location with your group every 5 minutes, even when the app is in the background.",
-          "locationWhenInUsePermission": "Whereru needs your location to share it with your group.",
+          "locationAlwaysAndWhenInUsePermission": "Honey Where Are You? shares your location with your group every 5 minutes, even when the app is in the background.",
+          "locationWhenInUsePermission": "Honey Where Are You? needs your location to share it with your group.",
           "isAndroidBackgroundLocationEnabled": true,
           "isAndroidForegroundServiceEnabled": true
         }
+      ],
+      [
+        "./plugins/withAndroidLabel",
+        "Where RU"
       ]
     ],
     "extra": {

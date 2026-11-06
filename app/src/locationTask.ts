@@ -49,7 +49,7 @@ export async function startSharing(): Promise<void> {
     pausesUpdatesAutomatically: false,
     showsBackgroundLocationIndicator: true,
     foregroundService: {
-      notificationTitle: 'Whereru',
+      notificationTitle: 'Honey Where Are You?',
       notificationBody: 'Sharing your location with your group',
     },
   });

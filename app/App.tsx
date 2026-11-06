@@ -76,7 +76,7 @@ function SetupScreen({ onSaved }: { onSaved: (profile: Profile) => void }) {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Whereru</Text>
+      <Text style={styles.title}>Honey Where Are You?</Text>
       <Text style={styles.subtitle}>Set up this phone</Text>
 
       <Text style={styles.label}>Server URL</Text>
@@ -218,7 +218,7 @@ function MainScreen({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.title}>Whereru</Text>
+        <Text style={styles.title}>Honey Where Are You?</Text>
         <PeopleMap people={mapPeople} baseUrl={profile.serverUrl} onPersonPress={onMapPersonPress} />
       </View>
 
