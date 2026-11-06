@@ -15,9 +15,13 @@ export async function loadProfile(): Promise<Profile | null> {
   return { serverUrl, token };
 }
 
+// multiSet writes both keys in one operation so a crash mid-save can't leave
+// a URL paired with the wrong token.
 export async function saveProfile(profile: Profile): Promise<void> {
-  await AsyncStorage.setItem(STORAGE_KEYS.serverUrl, profile.serverUrl);
-  await AsyncStorage.setItem(STORAGE_KEYS.token, profile.token);
+  await AsyncStorage.multiSet([
+    [STORAGE_KEYS.serverUrl, profile.serverUrl],
+    [STORAGE_KEYS.token, profile.token],
+  ]);
 }
 
 export async function clearProfile(): Promise<void> {

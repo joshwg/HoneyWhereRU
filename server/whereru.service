@@ -13,7 +13,9 @@ After=network.target
 Type=simple
 User=whereru
 WorkingDirectory=/opt/whereru
-EnvironmentFile=/etc/whereru/whereru.env
+# Same file the binary reads itself (loadDotEnv). The leading "-" makes it
+# optional so a missing file doesn't stop the service from starting.
+EnvironmentFile=-/opt/whereru/.env
 ExecStart=/opt/whereru/whereru-server
 Restart=on-failure
 RestartSec=5

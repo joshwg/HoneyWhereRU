@@ -32,7 +32,8 @@ plain-HTTP background network requests by default.
 
 ### Generate tokens
 
-Pick a random secret per person (up to ~6 people):
+Pick a random secret per person (up to ~6 people). Tokens must be 12–48
+characters; this makes a 12-character one with no look-alike characters:
 
 ```bash
 tr -dc 'abcdefghjkmnpqrstuvwxyz23456789' </dev/urandom | head -c 12; echo   # run once per person
@@ -67,6 +68,9 @@ sudo chown -R whereru:whereru /opt/whereru
 
 # Edit /opt/whereru/.env: set USERS=<token1>:Josh,<token2>:Wife,<token3>:Mom,...
 sudo nano /opt/whereru/.env
+
+# The file holds everyone's tokens -- make sure only the service user can read it
+sudo chmod 600 /opt/whereru/.env
 ```
 
 ### Run it as a systemd service
@@ -80,8 +84,10 @@ sudo systemctl enable --now whereru
 sudo systemctl status whereru   # should show "active (running)"
 ```
 
-The service listens on `127.0.0.1:3000` (not exposed directly) — a reverse
-proxy handles the public HTTPS side.
+The service reads its config from `/opt/whereru/.env` (both the binary and
+the systemd unit point at that file) and listens on `127.0.0.1:3000` only —
+a reverse proxy handles the public HTTPS side. Set `BIND_ADDR=0.0.0.0` in
+`.env` if you ever need it reachable directly.
 
 ### Put Apache2 in front for HTTPS
 
@@ -182,13 +188,21 @@ VPN & Device Management** and trust your developer certificate.
 ## 3. First-run setup, on each phone
 
 1. Open the app.
-2. Enter the server URL (e.g. `https://whereru.yourdomain.com`) and that
-   phone's token.
+2. Enter the server URL (e.g. `https://whereru.yourdomain.com`; it must be
+   `https://`) and that phone's token.
 3. Toggle **Share my location** on. Grant location permission, then when
    prompted for background access, choose **Always Allow** (or go to
    Settings afterward if the OS didn't ask directly — see below).
 4. Optionally tap **Send my location now** to confirm it's working
    end-to-end before waiting for the first automatic update.
+
+### Changing the server URL or token later
+
+Tap **Change server URL or token** at the bottom of the main screen. The
+fields come pre-filled; edit, then **Save** (the app checks the new values
+against the server first). Sharing keeps running — the background task
+picks up the new settings on its next update. The same screen has a
+**Forget this phone** option that stops sharing and clears everything.
 
 ### Getting "Always" location permission
 

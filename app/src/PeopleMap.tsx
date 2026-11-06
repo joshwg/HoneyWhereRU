@@ -8,12 +8,18 @@ export type MapPerson = PersonLocation & { label: string; isYou: boolean };
 
 // Leaflet + OpenStreetMap tiles inside a WebView: no API key needed. The page
 // exposes window.setPeople(); markers post a message back when tapped.
+//
+// The Leaflet tags carry Subresource Integrity hashes (sha384 of the 1.9.4
+// dist files) so a tampered CDN response is refused rather than executed.
+// Bump the version and hashes together if you upgrade Leaflet.
 const MAP_HTML = `<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
 <style>
   html, body, #map { margin: 0; height: 100%; width: 100%; }
   .fit { background: #fff; width: 30px; height: 30px; line-height: 30px; text-align: center;
@@ -24,6 +30,14 @@ const MAP_HTML = `<!DOCTYPE html>
 <div id="map"></div>
 <script>
   function post(msg) { window.ReactNativeWebView.postMessage(JSON.stringify(msg)); }
+
+  // Leaflet tooltips take HTML, so names from the server are escaped before
+  // they're rendered.
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
 
   var map = L.map('map', { zoomControl: true }).setView([39.5, -98.35], 3);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -73,7 +87,7 @@ const MAP_HTML = `<!DOCTYPE html>
         L.circle(ll, { radius: p.accuracy, color: color, weight: 1, fillOpacity: 0.1, interactive: false }).addTo(layer);
       }
       L.circleMarker(ll, { radius: 8, color: '#fff', weight: 2, fillColor: color, fillOpacity: 1 })
-        .bindTooltip(p.label, { permanent: true, direction: 'top', offset: [0, -8] })
+        .bindTooltip(escapeHtml(p.label), { permanent: true, direction: 'top', offset: [0, -8] })
         .on('click', function () { post({ type: 'person', lat: p.lat, lng: p.lng }); })
         .addTo(layer);
       bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
@@ -87,6 +101,12 @@ const MAP_HTML = `<!DOCTYPE html>
 </script>
 </body>
 </html>`;
+
+// The WebView can ask the app to open a link; only ordinary web URLs are
+// honoured so page content can't trigger tel:, sms:, or other app schemes.
+function isWebUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url);
+}
 
 export function PeopleMap({
   people,
@@ -123,8 +143,9 @@ export function PeopleMap({
         return;
       }
       if (msg.type === 'ready') setReady(true);
-      else if (msg.type === 'open' && msg.url) Linking.openURL(msg.url);
-      else if (msg.type === 'person' && msg.lat != null && msg.lng != null) onPersonPress(msg.lat, msg.lng);
+      else if (msg.type === 'open' && msg.url && isWebUrl(msg.url)) Linking.openURL(msg.url);
+      else if (msg.type === 'person' && typeof msg.lat === 'number' && typeof msg.lng === 'number')
+        onPersonPress(msg.lat, msg.lng);
     },
     [onPersonPress]
   );

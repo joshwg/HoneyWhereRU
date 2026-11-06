@@ -2,7 +2,7 @@ import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import { LOCATION_TASK_NAME, UPDATE_INTERVAL_MS } from './config';
 import { loadProfile } from './storage';
-import { postLocation } from './api';
+import { locationToPayload, postLocation } from './api';
 
 // Must be defined at module scope (not inside a component) so the OS can
 // re-run this file's top level and reattach the handler after the app has
@@ -17,16 +17,13 @@ TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
   const latest = locations?.[locations.length - 1];
   if (!latest) return;
 
+  // Read the profile fresh each time so a changed server URL or token takes
+  // effect on the next update without restarting sharing.
   const profile = await loadProfile();
   if (!profile) return; // not configured yet, nothing to send to
 
   try {
-    await postLocation(profile.serverUrl, profile.token, {
-      lat: latest.coords.latitude,
-      lng: latest.coords.longitude,
-      accuracy: latest.coords.accuracy,
-      timestamp: latest.timestamp,
-    });
+    await postLocation(profile.serverUrl, profile.token, locationToPayload(latest));
   } catch (err) {
     console.error('[locationTask] failed to send location:', err);
   }
