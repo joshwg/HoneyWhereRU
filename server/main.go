@@ -21,11 +21,43 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// The version lives in ../VERSION (shared with the app) and is stamped in by
+// build.sh via -ldflags. "dev" means the binary was built with plain go build.
+// Reported by /health and logged at startup, alongside the git commit.
+var version = "dev"
+
+// buildCommit returns the short git commit the binary was built from, with
+// "-dirty" appended if the working tree had uncommitted changes, or "" when
+// that info isn't available (e.g. built outside a git checkout).
+func buildCommit() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var rev, modified string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		}
+	}
+	if len(rev) > 7 {
+		rev = rev[:7]
+	}
+	if rev != "" && modified == "true" {
+		rev += "-dirty"
+	}
+	return rev
+}
 
 // Tokens must be between these lengths; entries outside the range are skipped.
 // The app enforces the same range in src/config.ts.
@@ -36,6 +68,13 @@ const (
 
 // Largest request body we'll read. A location POST is well under 200 bytes.
 const maxBodyBytes = 4096
+
+// A post that lands within this long of the same person's previous one is
+// acknowledged but not stored. Phones are meant to post every 5 minutes; this
+// is a backstop against an app build that posts far more often (older iOS
+// builds did every few seconds). Kept well under 5 minutes so a deliberate
+// "Send my location now" still gets through.
+const minPostGap = 60 * time.Second
 
 type location struct {
 	Name      string   `json:"name"`
@@ -134,8 +173,9 @@ func parseUsers(raw string) []user {
 }
 
 type server struct {
-	db    *sql.DB
-	users []user // read-only after startup, so safe to share across requests
+	db     *sql.DB
+	users  []user // read-only after startup, so safe to share across requests
+	commit string // from buildCommit(), computed once at startup
 }
 
 // authenticate compares the bearer token against every configured user in
@@ -182,7 +222,7 @@ func (s *server) withAuth(handler func(w http.ResponseWriter, r *http.Request, u
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": version, "commit": s.commit})
 }
 
 func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, userName string) {
@@ -212,7 +252,11 @@ func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, user
 		timestamp = int64(*body.Timestamp)
 	}
 
-	_, err := s.db.Exec(`
+	// The WHERE on DO UPDATE makes the rate limit atomic: the row is only
+	// touched if the previous write is old enough, and RowsAffected tells us
+	// which way it went. No separate read, so two near-simultaneous posts
+	// can't both slip through.
+	res, err := s.db.Exec(`
 		INSERT INTO locations (name, lat, lng, accuracy, timestamp, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
@@ -221,10 +265,17 @@ func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, user
 			accuracy = excluded.accuracy,
 			timestamp = excluded.timestamp,
 			updated_at = excluded.updated_at
-	`, userName, *body.Lat, *body.Lng, body.Accuracy, timestamp, now)
+		WHERE excluded.updated_at - locations.updated_at >= ?
+	`, userName, *body.Lat, *body.Lng, body.Accuracy, timestamp, now, minPostGap.Milliseconds())
 	if err != nil {
 		log.Printf("failed to upsert location: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to store location")
+		return
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		// Too soon after this person's last post: acknowledged, not stored,
+		// so an over-eager phone doesn't get an error and keep retrying.
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "throttled": true})
 		return
 	}
 
@@ -326,7 +377,7 @@ func main() {
 	}
 	defer db.Close()
 
-	s := &server{db: db, users: users}
+	s := &server{db: db, users: users, commit: buildCommit()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
@@ -339,7 +390,7 @@ func main() {
 	}
 
 	addr := net.JoinHostPort(bindAddr, port)
-	log.Printf("Whereru server listening on %s", addr)
+	log.Printf("Whereru server %s (%s) listening on %s", version, s.commit, addr)
 	log.Printf("Database: %s", dbPath)
 	log.Printf("Configured users: %s", strings.Join(names, ", "))
 

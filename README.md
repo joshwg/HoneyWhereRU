@@ -48,9 +48,12 @@ instance at all.
 
 ```bash
 cd server
-GOOS=linux GOARCH=amd64 go build -o whereru-server .   # amd64 EC2 instance
-# GOOS=linux GOARCH=arm64 go build -o whereru-server . # Graviton (arm64) instance — check `uname -m` on the instance
+./build.sh          # amd64 EC2 instance
+# ./build.sh arm64  # Graviton (arm64) instance — check `uname -m` on the instance
 ```
+
+`build.sh` stamps the version from the repo-root `VERSION` file into the
+binary (a plain `go build` works too, but reports version `dev`).
 
 ### Set up the instance
 
@@ -122,6 +125,18 @@ Follow the prompts (email address, agree to terms, choose "redirect" when
 asked about HTTP). Certbot also sets up automatic renewal via a systemd
 timer or cron job — nothing further to do.
 
+The vhost logs requests **without the client IP** (a custom `whereru_noip`
+format: time, request line, status, bytes, user-agent). That's enough to
+see how often phones post and whether anything is failing, without keeping
+a per-phone record of when and from where each person connected. If
+Certbot already created the `:443` block before you applied this format,
+check that its `CustomLog` line also says `whereru_noip` rather than
+`combined`. The earlier diagnostic command for post frequency still works:
+
+```bash
+sudo grep 'POST /api/location' /var/log/apache2/whereru-access.log | tail -n 300 | cut -c2-17 | uniq -c
+```
+
 Make sure your EC2 security group allows inbound TCP on ports 80 and 443
 (and 22 for SSH, which you presumably already have). Since Whereru is one
 vhost among possibly several on this Apache instance, this doesn't affect
@@ -131,13 +146,20 @@ any other sites it's already serving.
 
 ```bash
 curl https://whereru.yourdomain.com/health
-# {"ok":true}
+# {"ok":true,"version":"0.9.3","commit":"214d67c"}
 ```
+
+`version` comes from the `VERSION` file at the repo root -- the single
+place the version is set for both the server and the app (see
+"Versioning" below). `commit` is the git revision the binary was built
+from (Go embeds it automatically when you build inside the checkout) with
+`-dirty` appended if there were uncommitted changes, so you can tell exactly
+which code is running. The same line is logged at startup.
 
 ### Redeploying after a code change
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o whereru-server .
+./build.sh            # or ./build.sh arm64
 scp whereru-server ubuntu@<your-ec2-host>:/tmp/
 ssh ubuntu@<your-ec2-host> '
   sudo systemctl stop whereru
@@ -146,6 +168,17 @@ ssh ubuntu@<your-ec2-host> '
   sudo systemctl start whereru
 '
 ```
+
+### Versioning
+
+The version for **both** the server and the app lives in one file,
+`VERSION` at the repo root. To release a new version, change that file —
+nothing else:
+
+- `server/build.sh` stamps it into the binary (`/health` reports it).
+- `app/app.config.js` reads it and sets Expo's `version`, so the EAS build
+  and the phone's Settings page show the same number. (`app.json` holds
+  everything else; it no longer has a `version` key.)
 
 ## 2. Build the app with EAS
 
@@ -234,12 +267,19 @@ wherever you pan; the ⌖ button re-frames everyone on demand.
   enforces the 5-minute spacing itself: it will not post twice within 5
   minutes, whatever the OS delivers (a manual "Send my location now" also
   starts a new 5-minute window). So the server sees the same cadence from
-  both platforms. If an iPhone sits still for a long time iOS may deliver fewer
+  both platforms. The server also has its own backstop: a post within 60
+  seconds of the same person's previous one is acknowledged (`{"ok":true,
+  "throttled":true}`) but not stored, so an over-eager app build can't
+  flood the database. If an iPhone sits still for a long time iOS may deliver fewer
   updates; that doesn't cost you anything in practice, because the last
   reported location is still accurate.
 - **Tokens are the only security.** Anyone with a token can see (and spoof)
   that person's location. Keep them secret; don't commit `.env` or paste
   tokens anywhere public.
+- **Only the latest position is stored.** The `locations` table holds one
+  row per person, overwritten on every post -- there is no history, and
+  nothing to prune. The Apache access log keeps ~14 days of request lines
+  (Ubuntu's default logrotate) but, with the format above, no IPs.
 - **This is not encrypted end-to-end** beyond standard HTTPS transport —
   the server operator can see everyone's location in the SQLite file.
   That's expected for a self-hosted tool for a small trusted group, just
