@@ -17,7 +17,7 @@ import * as Location from 'expo-location';
 import { fetchLocations, locationToPayload, normalizeUrl, postLocation, type PersonLocation } from './src/api';
 import { formatRelativeTime } from './src/formatTime';
 import { isSharing, startSharing, stopSharing } from './src/locationTask';
-import { clearProfile, loadProfile, saveProfile, type Profile } from './src/storage';
+import { clearProfile, loadProfile, saveLastSentAt, saveProfile, type Profile } from './src/storage';
 import { POLL_INTERVAL_MS, TOKEN_MAX_LEN, TOKEN_MIN_LEN } from './src/config';
 import { PeopleMap, type MapPerson } from './src/PeopleMap';
 
@@ -74,6 +74,14 @@ async function ensureForegroundPermission(): Promise<boolean> {
   return false;
 }
 
+// Whatever was thrown, produce something readable for an alert: an Error's
+// message, or the raw value if it wasn't an Error (or had no message).
+function errorText(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  const s = String(err);
+  return s && s !== '[object Object]' ? s : 'No details were given.';
+}
+
 function openInMaps(lat: number, lng: number) {
   Linking.openURL(`https://www.google.com/maps?q=${lat},${lng}`);
 }
@@ -121,7 +129,7 @@ function SetupScreen({
       await saveProfile(p);
       onSaved(p);
     } catch (err) {
-      Alert.alert('Could not connect', `Double-check the server URL and token.\n\n${(err as Error).message}`);
+      Alert.alert('Could not connect', `Double-check the server URL and token.\n\n${errorText(err)}`);
     } finally {
       setSaving(false);
     }
@@ -139,7 +147,7 @@ function SetupScreen({
             await clearProfile();
             onForget?.();
           } catch (err) {
-            Alert.alert('Could not reset', (err as Error).message);
+            Alert.alert('Could not reset', errorText(err));
           }
         },
       },
@@ -252,7 +260,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
         setSharing(false);
       }
     } catch (err) {
-      Alert.alert('Something went wrong', (err as Error).message);
+      Alert.alert('Something went wrong', errorText(err));
     } finally {
       setBusy(false);
     }
@@ -264,9 +272,12 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
       if (!(await ensureForegroundPermission())) return;
       const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
       await postLocation(profile.serverUrl, profile.token, locationToPayload(loc));
+      // Counts toward the 5-minute window, so the background task won't
+      // follow a manual send with another post seconds later.
+      await saveLastSentAt(Date.now());
       await refresh();
     } catch (err) {
-      Alert.alert('Could not send location', (err as Error).message);
+      Alert.alert('Could not send location', errorText(err));
     } finally {
       setBusy(false);
     }

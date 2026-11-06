@@ -204,6 +204,13 @@ against the server first). Sharing keeps running — the background task
 picks up the new settings on its next update. The same screen has a
 **Forget this phone** option that stops sharing and clears everything.
 
+### How the map frames people
+
+With exactly one other person (a two-person group) the map keeps that
+person centred and re-centres whenever their position changes; your zoom
+level is left alone. With more people it frames everyone once, then stays
+wherever you pan; the ⌖ button re-frames everyone on demand.
+
 ### Getting "Always" location permission
 
 - **iOS**: The system dialog usually offers "Allow Once" / "Allow While
@@ -222,11 +229,14 @@ picks up the new settings on its next update. The same screen has a
 ## Caveats
 
 - **iOS update cadence is best-effort, not exact.** Android honors the
-  5-minute timer precisely. iOS treats background location as
-  movement/event-driven rather than timer-driven, so updates may arrive
-  faster or slower than 5 minutes depending on motion and OS power
-  management. This doesn't cost you anything in practice: if the phone
-  hasn't moved, the last reported location is still accurate.
+  5-minute timer precisely. iOS ignores the timer and hands the app a
+  location whenever it has one -- every few seconds when moving. The app
+  enforces the 5-minute spacing itself: it will not post twice within 5
+  minutes, whatever the OS delivers (a manual "Send my location now" also
+  starts a new 5-minute window). So the server sees the same cadence from
+  both platforms. If an iPhone sits still for a long time iOS may deliver fewer
+  updates; that doesn't cost you anything in practice, because the last
+  reported location is still accurate.
 - **Tokens are the only security.** Anyone with a token can see (and spoof)
   that person's location. Keep them secret; don't commit `.env` or paste
   tokens anywhere public.

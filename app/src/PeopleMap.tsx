@@ -55,6 +55,9 @@ const MAP_HTML = `<!DOCTYPE html>
   var layer = L.layerGroup().addTo(map);
   var bounds = null;
   var fitted = false;
+  // With exactly one other person the map follows them: the "lat,lng" we
+  // last centred on, so a redraw that didn't move them doesn't touch the view.
+  var followed = null;
 
   function fitAll() {
     if (!bounds) return;
@@ -92,8 +95,22 @@ const MAP_HTML = `<!DOCTYPE html>
         .addTo(layer);
       bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
     });
-    // Only auto-frame once, so a background refresh doesn't yank the view
-    // away from wherever the user has panned to.
+    var others = people.filter(function (p) { return !p.isYou; });
+    if (others.length === 1) {
+      // Two-person mode: keep the other person centred. Re-centre whenever
+      // their position changes; keep whatever zoom the user has chosen.
+      var o = others[0];
+      var key = o.lat + ',' + o.lng;
+      if (key !== followed) {
+        followed = key;
+        map.setView([o.lat, o.lng], fitted ? map.getZoom() : 15);
+        fitted = true;
+      }
+      return;
+    }
+    followed = null;
+    // Group mode: only auto-frame once, so a background refresh doesn't yank
+    // the view away from wherever the user has panned to.
     if (!fitted && bounds) { fitAll(); fitted = true; }
   };
 

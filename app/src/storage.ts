@@ -25,5 +25,15 @@ export async function saveProfile(profile: Profile): Promise<void> {
 }
 
 export async function clearProfile(): Promise<void> {
-  await AsyncStorage.multiRemove([STORAGE_KEYS.serverUrl, STORAGE_KEYS.token]);
+  await AsyncStorage.multiRemove([STORAGE_KEYS.serverUrl, STORAGE_KEYS.token, STORAGE_KEYS.lastSentAt]);
+}
+
+export async function loadLastSentAt(): Promise<number> {
+  const raw = await AsyncStorage.getItem(STORAGE_KEYS.lastSentAt);
+  const n = raw ? Number(raw) : 0;
+  return Number.isFinite(n) ? n : 0;
+}
+
+export async function saveLastSentAt(ms: number): Promise<void> {
+  await AsyncStorage.setItem(STORAGE_KEYS.lastSentAt, String(ms));
 }

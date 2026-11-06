@@ -4,6 +4,15 @@ export const LOCATION_TASK_NAME = 'whereru-background-location-task';
 // Exact on Android; best-effort on iOS (see README for why).
 export const UPDATE_INTERVAL_MS = 5 * 60 * 1000;
 
+// Hard floor between two location posts from this phone, whether from the
+// background task or the "Send my location now" button. Android already
+// spaces fixes by UPDATE_INTERVAL_MS at the OS level; iOS ignores that
+// setting and can deliver a location every few seconds, so the app enforces
+// the cadence itself. The 2-second allowance only absorbs timing jitter
+// between the OS timer and when the task actually runs, so an Android fix
+// arriving at 4:59.8 isn't dropped and pushed out to the 10-minute mark.
+export const MIN_SEND_GAP_MS = UPDATE_INTERVAL_MS - 2 * 1000;
+
 // How often the foregrounded app re-checks everyone else's last known spot.
 export const POLL_INTERVAL_MS = 60 * 1000;
 
@@ -19,4 +28,6 @@ export const TOKEN_MAX_LEN = 48;
 export const STORAGE_KEYS = {
   serverUrl: 'whereru:serverUrl',
   token: 'whereru:token',
+  // When the background task last posted successfully (ms since epoch).
+  lastSentAt: 'whereru:lastSentAt',
 } as const;
