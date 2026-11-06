@@ -35,7 +35,7 @@ plain-HTTP background network requests by default.
 Pick a random secret per person (up to ~6 people):
 
 ```bash
-openssl rand -hex 24   # run once per person
+tr -dc 'abcdefghjkmnpqrstuvwxyz23456789' </dev/urandom | head -c 12; echo   # run once per person
 ```
 
 ### Build the binary

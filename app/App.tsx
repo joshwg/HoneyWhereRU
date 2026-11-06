@@ -57,6 +57,11 @@ function SetupScreen({ onSaved }: { onSaved: (profile: Profile) => void }) {
       Alert.alert('Missing info', 'Enter both the server URL and your token.');
       return;
     }
+    const len = token.trim().length;
+    if (len < 12 || len > 48) {
+      Alert.alert('Check your token', `Tokens are 12 to 48 characters. You entered ${len}.`);
+      return;
+    }
     setSaving(true);
     try {
       const p = { serverUrl: serverUrl.trim(), token: token.trim() };
@@ -96,7 +101,6 @@ function SetupScreen({ onSaved }: { onSaved: (profile: Profile) => void }) {
         placeholder="the token your server assigned you"
         autoCapitalize="none"
         autoCorrect={false}
-        secureTextEntry
         value={token}
         onChangeText={setToken}
       />

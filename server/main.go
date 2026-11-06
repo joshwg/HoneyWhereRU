@@ -66,6 +66,12 @@ func loadDotEnv(path string) {
 	}
 }
 
+// Tokens must be between these lengths; entries outside the range are skipped.
+const (
+	minTokenLen = 12
+	maxTokenLen = 48
+)
+
 func parseUsers(raw string) map[string]string {
 	tokenToName := make(map[string]string)
 	for _, entry := range strings.Split(raw, ",") {
@@ -76,6 +82,10 @@ func parseUsers(raw string) map[string]string {
 		token, name, ok := strings.Cut(entry, ":")
 		token, name = strings.TrimSpace(token), strings.TrimSpace(name)
 		if !ok || token == "" || name == "" {
+			continue
+		}
+		if len(token) < minTokenLen || len(token) > maxTokenLen {
+			log.Printf("WARNING: skipping user %q: token must be %d-%d characters (got %d)", name, minTokenLen, maxTokenLen, len(token))
 			continue
 		}
 		tokenToName[token] = name
