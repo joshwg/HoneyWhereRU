@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Linking,
   Pressable,
   ScrollView,
@@ -12,16 +13,25 @@ import {
   View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Location from 'expo-location';
 
 import { fetchLocations, locationToPayload, normalizeUrl, postLocation, type PersonLocation } from './src/api';
-import { formatRelativeTime } from './src/formatTime';
+import { formatRelativeTime, formatSpeedSuffix } from './src/formatTime';
 import { isSharing, startSharing, stopSharing } from './src/locationTask';
 import { clearProfile, loadProfile, saveLastSentAt, saveProfile, type Profile } from './src/storage';
 import { POLL_INTERVAL_MS, TOKEN_MAX_LEN, TOKEN_MIN_LEN } from './src/config';
 import { PeopleMap, type MapPerson } from './src/PeopleMap';
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
+  );
+}
+
+function AppContent() {
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [editing, setEditing] = useState(false);
@@ -99,6 +109,7 @@ function SetupScreen({
   onCancel?: () => void;
   onForget?: () => void;
 }) {
+  const insets = useSafeAreaInsets();
   const [serverUrl, setServerUrl] = useState(initial?.serverUrl ?? '');
   const [token, setToken] = useState(initial?.token ?? '');
   const [saving, setSaving] = useState(false);
@@ -155,7 +166,7 @@ function SetupScreen({
   }, [onForget]);
 
   return (
-    <View style={[styles.container, styles.setup]}>
+    <View style={[styles.container, styles.setup, { paddingBottom: insets.bottom }]}>
       <Text style={styles.title}>Honey Where Are You?</Text>
       <Text style={styles.subtitle}>{initial ? 'Change server or token' : 'Set up this phone'}</Text>
 
@@ -207,6 +218,9 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
   const [others, setOthers] = useState<PersonLocation[]>([]);
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(Date.now());
+  // Android draws edge-to-edge, so the scroll content needs room for the
+  // navigation bar or the last button sits underneath it.
+  const insets = useSafeAreaInsets();
   // Polls can overlap (timer + "send now"); only the newest response wins so
   // a slow earlier reply can't overwrite fresher data.
   const latestRequest = useRef(0);
@@ -232,11 +246,20 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
 
     const poll = setInterval(refresh, POLL_INTERVAL_MS);
     const clock = setInterval(() => setNow(Date.now()), 15_000);
+    // Timers are paused while the app is backgrounded, so refresh as soon as
+    // it comes back rather than showing stale positions until the next tick.
+    const appState = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        setNow(Date.now());
+        refresh();
+      }
+    });
     return () => {
       active = false;
       latestRequest.current++; // drop any in-flight response
       clearInterval(poll);
       clearInterval(clock);
+      appState.remove();
     };
   }, [refresh]);
 
@@ -286,7 +309,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
   const mapPeople = useMemo<MapPerson[]>(() => {
     const list: MapPerson[] = others.map((p) => ({
       ...p,
-      label: `${p.name} · ${formatRelativeTime(p.updatedAt, now)}`,
+      label: `${p.name} · ${formatRelativeTime(p.updatedAt, now)}${formatSpeedSuffix(p.speedMph)}`,
       isYou: false,
     }));
     if (you) list.push({ ...you, label: 'You', isYou: true });
@@ -300,7 +323,10 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
         <PeopleMap people={mapPeople} baseUrl={profile.serverUrl} onPersonPress={openInMaps} />
       </View>
 
-      <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
+      <ScrollView
+        style={styles.container}
+        contentContainerStyle={[styles.scrollContent, { paddingBottom: styles.scrollContent.paddingBottom + insets.bottom }]}
+      >
         <View style={styles.row}>
           <Text style={styles.label}>Share my location</Text>
           <Switch value={sharing} onValueChange={toggleSharing} disabled={busy} />
@@ -323,7 +349,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
             <PersonCard
               key={person.name}
               title={person.name}
-              body={`Last seen ${formatRelativeTime(person.updatedAt, now)}`}
+              body={`Last seen ${formatRelativeTime(person.updatedAt, now)}${formatSpeedSuffix(person.speedMph)}`}
               spaced
               onPress={() => openInMaps(person.lat, person.lng)}
             />
@@ -335,7 +361,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
         <Text style={styles.sectionTitle}>You</Text>
         {you ? (
           <PersonCard
-            title={`Last sent ${formatRelativeTime(you.updatedAt, now)}`}
+            title={`Last sent ${formatRelativeTime(you.updatedAt, now)}${formatSpeedSuffix(you.speedMph)}`}
             body={`${you.lat.toFixed(5)}, ${you.lng.toFixed(5)}${
               you.accuracy != null ? ` (±${Math.round(you.accuracy)} m)` : ''
             }`}

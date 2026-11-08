@@ -3,7 +3,8 @@
 // Deliberately minimal: a handful of people (up to ~6), each with a bearer
 // token, and a SQLite table holding everyone's last known position. A
 // person's phone POSTs its coordinates every 5 minutes; any phone can GET
-// the latest known position of everyone else.
+// the latest known position of everyone else. A second table keeps each
+// stored post for historyRetention, then prunes it.
 //
 // Configure users via the USERS env var (see .env.example), e.g.:
 //
@@ -76,6 +77,48 @@ const maxBodyBytes = 4096
 // "Send my location now" still gets through.
 const minPostGap = 60 * time.Second
 
+// How long rows in location_history are kept. Pruned on every stored post
+// and by a background ticker (historyPruneEvery), so a trail still expires
+// when nobody is posting. Measured against updated_at (server clock), not the
+// phone's timestamp, so a phone with a wrong clock can't keep rows alive.
+const (
+	historyRetention  = 4 * time.Hour
+	historyPruneEvery = 10 * time.Minute
+)
+
+// Speed is an EWMA of the per-segment speeds between each person's last
+// speedPoints history rows (so up to speedPoints-1 segments), oldest to
+// newest, with the usual N-period weight alpha = 2/(N+1). It's not the
+// phone's instantaneous GPS speed, which iOS often omits in the background.
+//
+// Per segment:
+//   - closer than speedMinGap apart in time: skipped (too short to measure),
+//   - further than speedMaxGap apart: the run is broken there and everything
+//     older is discarded, so a trip from before a long stop doesn't leak in,
+//   - above speedMaxMph: skipped as a bad fix, not real movement,
+//   - a move smaller than the two fixes' combined accuracy counts as 0 (GPS
+//     jitter, not movement).
+//
+// If the newest usable segment is 0 (no movement beyond GPS jitter), the
+// result is 0 rather than the EWMA: otherwise someone who just parked would
+// show a decaying speed (~16 mph after 15 min stopped from 30 mph) for half
+// an hour. The EWMA itself isn't reset, so a single stop at a red light
+// doesn't throw away the smoothing once they move again.
+//
+// The result is null when the latest post is older than speedMaxAge (they may
+// have stopped since) or no usable segment is left.
+const (
+	speedPoints     = 10
+	speedAlpha      = 2.0 / (speedPoints + 1)
+	speedMaxAge     = 15 * time.Minute
+	speedMinGap     = 30 * time.Second
+	speedMaxGap     = 20 * time.Minute
+	speedMaxMph     = 700.0
+	defaultAccuracy = 20.0 // metres, assumed when a fix has no accuracy
+	metresPerMile   = 1609.344
+	earthRadiusM    = 6371000.0
+)
+
 type location struct {
 	Name      string   `json:"name"`
 	Lat       float64  `json:"lat"`
@@ -83,6 +126,116 @@ type location struct {
 	Accuracy  *float64 `json:"accuracy"`
 	Timestamp int64    `json:"timestamp"`
 	UpdatedAt int64    `json:"updatedAt"`
+	SpeedMph  *float64 `json:"speedMph"`
+}
+
+// haversineMetres is the great-circle distance between two points.
+func haversineMetres(lat1, lng1, lat2, lng2 float64) float64 {
+	toRad := math.Pi / 180
+	dLat := (lat2 - lat1) * toRad
+	dLng := (lng2 - lng1) * toRad
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*toRad)*math.Cos(lat2*toRad)*math.Sin(dLng/2)*math.Sin(dLng/2)
+	return 2 * earthRadiusM * math.Asin(math.Min(1, math.Sqrt(a)))
+}
+
+// segmentMph is the speed in mph from prev to cur. ok is false when the
+// segment should be skipped; brk is true when the gap is long enough that
+// everything before it should be dropped.
+func segmentMph(prev, cur location) (mph float64, ok, brk bool) {
+	// Fix times from the same phone, so any clock offset cancels out.
+	dtMs := cur.Timestamp - prev.Timestamp
+	if dtMs > speedMaxGap.Milliseconds() {
+		return 0, false, true
+	}
+	if dtMs < speedMinGap.Milliseconds() {
+		return 0, false, false
+	}
+	acc := func(a *float64) float64 {
+		if a == nil {
+			return defaultAccuracy
+		}
+		return *a
+	}
+	dist := haversineMetres(prev.Lat, prev.Lng, cur.Lat, cur.Lng)
+	if dist > acc(prev.Accuracy)+acc(cur.Accuracy) {
+		mph = dist / (float64(dtMs) / 1000) / metresPerMile * 3600
+	}
+	if mph > speedMaxMph {
+		return 0, false, false
+	}
+	return mph, true, false
+}
+
+// ewmaSpeed returns the smoothed speed in mph over points (oldest first), or
+// nil if it can't be trusted (see the rules above speedPoints). nowMs is the
+// server clock, compared with updated_at (also server clock).
+func ewmaSpeed(points []location, nowMs int64) *float64 {
+	if len(points) < 2 || nowMs-points[len(points)-1].UpdatedAt > speedMaxAge.Milliseconds() {
+		return nil
+	}
+	var ewma, newest float64
+	have := false
+	for i := 1; i < len(points); i++ {
+		mph, ok, brk := segmentMph(points[i-1], points[i])
+		if brk {
+			have = false
+			continue
+		}
+		if !ok {
+			continue
+		}
+		newest = mph
+		if !have {
+			ewma, have = mph, true
+		} else {
+			ewma = speedAlpha*mph + (1-speedAlpha)*ewma
+		}
+	}
+	if !have {
+		return nil
+	}
+	if newest == 0 {
+		ewma = 0
+	}
+	return &ewma
+}
+
+// recentSpeeds returns each person's smoothed speed (by name) from their last
+// speedPoints history rows; people without a trustworthy speed are absent.
+func (s *server) recentSpeeds(nowMs int64) (map[string]float64, error) {
+	rows, err := s.db.Query(`
+		SELECT name, lat, lng, accuracy, timestamp, updated_at FROM (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY updated_at DESC, id DESC) AS rn
+			FROM location_history
+		) WHERE rn <= ?
+		ORDER BY name, rn DESC
+	`, speedPoints)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// rn DESC: each person's rows arrive oldest first.
+	byName := map[string][]location{}
+	for rows.Next() {
+		var loc location
+		if err := rows.Scan(&loc.Name, &loc.Lat, &loc.Lng, &loc.Accuracy, &loc.Timestamp, &loc.UpdatedAt); err != nil {
+			return nil, err
+		}
+		byName[loc.Name] = append(byName[loc.Name], loc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	speeds := map[string]float64{}
+	for name, points := range byName {
+		if mph := ewmaSpeed(points, nowMs); mph != nil {
+			speeds[name] = *mph
+		}
+	}
+	return speeds, nil
 }
 
 type locationPost struct {
@@ -256,7 +409,15 @@ func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, user
 	// touched if the previous write is old enough, and RowsAffected tells us
 	// which way it went. No separate read, so two near-simultaneous posts
 	// can't both slip through.
-	res, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("failed to begin location transaction: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to store location")
+		return
+	}
+	defer tx.Rollback() // no-op once committed
+
+	res, err := tx.Exec(`
 		INSERT INTO locations (name, lat, lng, accuracy, timestamp, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
@@ -279,10 +440,40 @@ func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
+	// Only posts that passed the rate limit reach the history, so it gets
+	// the same at-most-once-a-minute rhythm as the latest-position table.
+	if _, err := tx.Exec(`
+		INSERT INTO location_history (name, lat, lng, accuracy, timestamp, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, userName, *body.Lat, *body.Lng, body.Accuracy, timestamp, now); err != nil {
+		log.Printf("failed to insert location history: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to store location")
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM location_history WHERE updated_at < ?`,
+		now-historyRetention.Milliseconds()); err != nil {
+		log.Printf("failed to prune location history: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to store location")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("failed to commit location: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to store location")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *server) handleGetLocations(w http.ResponseWriter, r *http.Request, userName string) {
+	// Speed is a nice-to-have: if it fails, still return the positions. Run
+	// before the main query: the pool has one connection, so a second query
+	// while those rows are open would wait forever.
+	speeds, err := s.recentSpeeds(time.Now().UnixMilli())
+	if err != nil {
+		log.Printf("failed to compute speeds: %v", err)
+	}
+
 	rows, err := s.db.Query(`SELECT name, lat, lng, accuracy, timestamp, updated_at FROM locations`)
 	if err != nil {
 		log.Printf("failed to query locations: %v", err)
@@ -299,6 +490,9 @@ func (s *server) handleGetLocations(w http.ResponseWriter, r *http.Request, user
 			log.Printf("failed to scan location row: %v", err)
 			writeError(w, http.StatusInternalServerError, "failed to load locations")
 			return
+		}
+		if mph, ok := speeds[loc.Name]; ok {
+			loc.SpeedMph = &mph
 		}
 		if loc.Name == userName {
 			you = &loc
@@ -338,13 +532,46 @@ func openDB(dbPath string) (*sql.DB, error) {
 			accuracy REAL,
 			timestamp INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
-		)
+		);
+		CREATE TABLE IF NOT EXISTS location_history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			lat REAL NOT NULL,
+			lng REAL NOT NULL,
+			accuracy REAL,
+			timestamp INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS location_history_updated_at ON location_history (updated_at);
+		CREATE INDEX IF NOT EXISTS location_history_name_updated_at ON location_history (name, updated_at);
 	`)
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// pruneHistory deletes history rows older than historyRetention.
+func pruneHistory(db *sql.DB) {
+	cutoff := time.Now().Add(-historyRetention).UnixMilli()
+	res, err := db.Exec(`DELETE FROM location_history WHERE updated_at < ?`, cutoff)
+	if err != nil {
+		log.Printf("failed to prune location history: %v", err)
+		return
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		log.Printf("pruned %d location history rows", n)
+	}
+}
+
+// pruneHistoryLoop runs pruneHistory at startup and then every
+// historyPruneEvery, so history expires even when no posts arrive.
+func pruneHistoryLoop(db *sql.DB) {
+	pruneHistory(db)
+	for range time.Tick(historyPruneEvery) {
+		pruneHistory(db)
+	}
 }
 
 func main() {
@@ -378,6 +605,7 @@ func main() {
 	defer db.Close()
 
 	s := &server{db: db, users: users, commit: buildCommit()}
+	go pruneHistoryLoop(db)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)

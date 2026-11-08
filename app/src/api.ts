@@ -8,6 +8,10 @@ export type PersonLocation = {
   accuracy: number | null;
   timestamp: number;
   updatedAt: number;
+  // Average over the last update interval, worked out by the server. Null
+  // (or absent, from an older server) when it isn't known or the latest
+  // position is too old to say how fast they're going now.
+  speedMph?: number | null;
 };
 
 export type LocationsResponse = {

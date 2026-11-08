@@ -8,3 +8,11 @@ export function formatRelativeTime(fromMs: number, nowMs: number = Date.now()): 
   const diffDay = Math.round(diffHr / 24);
   return `${diffDay} day${diffDay === 1 ? '' : 's'} ago`;
 }
+
+// " · 34 mph", " · not moving", or "" when the speed isn't known, ready to
+// append after a "last seen" time. Under 1 mph is treated as standing still.
+export function formatSpeedSuffix(mph: number | null | undefined): string {
+  if (mph == null || !Number.isFinite(mph)) return '';
+  if (mph < 1) return ' · not moving';
+  return ` · ${Math.round(mph)} mph`;
+}
