@@ -20,7 +20,7 @@
       }
     },
     "android": {
-      "package": "com.whereru.app",
+      "package": "com.joshwg.whereru",
       "adaptiveIcon": {
         "backgroundColor": "#F2EFE6",
         "foregroundImage": "./assets/android-icon-foreground.png",

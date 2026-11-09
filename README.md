@@ -188,7 +188,12 @@ npx eas login
 npx eas build:configure   # links this project to your Expo/EAS account
 ```
 
-### Android
+Build numbers (iOS `buildNumber`, Android `versionCode`) are kept by EAS
+on its servers (`"appVersionSource": "remote"` in `eas.json`) and bumped
+automatically on every build. The version people see comes from `VERSION`
+(see "Versioning" above). Phones and tablets are both supported.
+
+### Android (APK, installed directly)
 
 ```bash
 npx eas build --platform android --profile preview
@@ -198,25 +203,36 @@ This produces a downloadable APK link when it finishes. Open the link on
 the Android phone and install it directly (you may need to allow "install
 unknown apps" for the browser once).
 
-### iOS
+The Android package is `com.joshwg.whereru` (matching iOS). Builds from
+before 1.0.0 used `com.whereru.app`, which Android treats as a different
+app: uninstall the old one, install the new APK, and enter the server URL
+and token again.
 
-Ad-hoc distribution requires each iPhone to be registered to your Apple
-Developer account first:
-
-```bash
-npx eas device:create
-```
-
-This gives you a link — have that person open it **on their iPhone** to
-register the device, then build:
+### iOS (TestFlight)
 
 ```bash
-npx eas build --platform ios --profile preview
+npx eas build --platform ios --profile testflight
+npx eas submit --platform ios --profile testflight --latest
 ```
 
-When it finishes, EAS gives you an install link/QR code. Open it on the
-iPhone to install. The first time it's opened, go to **Settings → General →
-VPN & Device Management** and trust your developer certificate.
+The first run creates the app in App Store Connect if needed. Once Apple
+finishes processing the build (usually 5–30 minutes), add people under
+**App Store Connect → the app → TestFlight**:
+
+- **Internal testers** (up to 100, must be on your App Store Connect team):
+  no review, builds are available as soon as they're processed.
+- **External testers** (anyone by email or public link): the first build
+  of each version needs a short Beta App Review. Give the reviewer a
+  server URL and a token in the review notes, since the app does nothing
+  without them.
+
+Each tester installs Apple's **TestFlight** app and accepts the invite.
+TestFlight builds expire after 90 days, so rebuild at least that often.
+
+The old ad-hoc route (`npx eas device:create` to register each iPhone,
+then `--profile preview`) still works for a quick test build on your own
+devices, but TestFlight is the normal way to get it onto the group's
+phones.
 
 ## 3. First-run setup, on each phone
 
