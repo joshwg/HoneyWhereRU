@@ -2,7 +2,8 @@
 //
 // Deliberately minimal: a handful of people (up to ~6), each with a bearer
 // token, and a SQLite table holding everyone's last known position. A
-// person's phone POSTs its coordinates every 5 minutes; any phone can GET
+// person's phone POSTs its coordinates every 5 minutes (every 5-20 seconds
+// during "quick updates"); any phone can GET
 // the latest known position of everyone else. A second table keeps each
 // stored post for historyRetention, then prunes it.
 //
@@ -71,11 +72,12 @@ const (
 const maxBodyBytes = 4096
 
 // A post that lands within this long of the same person's previous one is
-// acknowledged but not stored. Phones are meant to post every 5 minutes; this
-// is a backstop against an app build that posts far more often (older iOS
-// builds did every few seconds). Kept well under 5 minutes so a deliberate
-// "Send my location now" still gets through.
-const minPostGap = 60 * time.Second
+// acknowledged but not stored. Phones post every 5 minutes normally and at
+// most every 5 seconds during quick updates (the app enforces both); this is
+// only a backstop against a runaway build. It sits under 5 seconds with room
+// for network jitter, so two quick-update posts sent 5 seconds apart aren't
+// dropped because the first one arrived late.
+const minPostGap = 2 * time.Second
 
 // How long rows in location_history are kept. Pruned on every stored post
 // and by a background ticker (historyPruneEvery), so a trail still expires
@@ -86,13 +88,15 @@ const (
 	historyPruneEvery = 10 * time.Minute
 )
 
-// Speed is an EWMA of the per-segment speeds between each person's last
-// speedPoints history rows (so up to speedPoints-1 segments), oldest to
+// Speed is an EWMA of the newest speedPoints-1 usable segments in each
+// person's recent history rows (at most speedFetchRows of them), oldest to
 // newest, with the usual N-period weight alpha = 2/(N+1). It's not the
 // phone's instantaneous GPS speed, which iOS often omits in the background.
 //
 // Per segment:
-//   - closer than speedMinGap apart in time: skipped (too short to measure),
+//   - closer than speedMinGap apart in time: the newer row is skipped and the
+//     segment start stays put, so quick updates (a post every few seconds)
+//     are measured over ~speedMinGap stretches instead of being dropped,
 //   - further than speedMaxGap apart: the run is broken there and everything
 //     older is discarded, so a trip from before a long stop doesn't leak in,
 //   - above speedMaxMph: skipped as a bad fix, not real movement,
@@ -109,6 +113,7 @@ const (
 // have stopped since) or no usable segment is left.
 const (
 	speedPoints     = 10
+	speedFetchRows  = 120 // 10 minutes of quick updates at one post per 5 s
 	speedAlpha      = 2.0 / (speedPoints + 1)
 	speedMaxAge     = 15 * time.Minute
 	speedMinGap     = 30 * time.Second
@@ -174,35 +179,44 @@ func ewmaSpeed(points []location, nowMs int64) *float64 {
 	if len(points) < 2 || nowMs-points[len(points)-1].UpdatedAt > speedMaxAge.Milliseconds() {
 		return nil
 	}
-	var ewma, newest float64
-	have := false
-	for i := 1; i < len(points); i++ {
-		mph, ok, brk := segmentMph(points[i-1], points[i])
+	// Collect usable segments, oldest first. start is the row the next
+	// segment is measured from; it only moves on once a segment is
+	// complete (long enough, or a break), so short gaps accumulate.
+	var segs []float64
+	start := points[0]
+	for _, cur := range points[1:] {
+		mph, ok, brk := segmentMph(start, cur)
 		if brk {
-			have = false
+			segs = segs[:0]
+			start = cur
 			continue
 		}
-		if !ok {
-			continue
+		if cur.Timestamp-start.Timestamp < speedMinGap.Milliseconds() {
+			continue // too short yet: keep measuring from start
 		}
-		newest = mph
-		if !have {
-			ewma, have = mph, true
-		} else {
-			ewma = speedAlpha*mph + (1-speedAlpha)*ewma
+		start = cur
+		if ok {
+			segs = append(segs, mph)
 		}
 	}
-	if !have {
+	if len(segs) == 0 {
 		return nil
 	}
-	if newest == 0 {
+	if len(segs) > speedPoints-1 {
+		segs = segs[len(segs)-(speedPoints-1):]
+	}
+	ewma := segs[0]
+	for _, mph := range segs[1:] {
+		ewma = speedAlpha*mph + (1-speedAlpha)*ewma
+	}
+	if segs[len(segs)-1] == 0 {
 		ewma = 0
 	}
 	return &ewma
 }
 
 // recentSpeeds returns each person's smoothed speed (by name) from their last
-// speedPoints history rows; people without a trustworthy speed are absent.
+// speedFetchRows history rows; people without a trustworthy speed are absent.
 func (s *server) recentSpeeds(nowMs int64) (map[string]float64, error) {
 	rows, err := s.db.Query(`
 		SELECT name, lat, lng, accuracy, timestamp, updated_at FROM (
@@ -210,7 +224,7 @@ func (s *server) recentSpeeds(nowMs int64) (map[string]float64, error) {
 			FROM location_history
 		) WHERE rn <= ?
 		ORDER BY name, rn DESC
-	`, speedPoints)
+	`, speedFetchRows)
 	if err != nil {
 		return nil, err
 	}
@@ -441,7 +455,7 @@ func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, user
 	}
 
 	// Only posts that passed the rate limit reach the history, so it gets
-	// the same at-most-once-a-minute rhythm as the latest-position table.
+	// the same rhythm as the latest-position table.
 	if _, err := tx.Exec(`
 		INSERT INTO location_history (name, lat, lng, accuracy, timestamp, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)

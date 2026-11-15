@@ -18,9 +18,9 @@ import * as Location from 'expo-location';
 
 import { fetchLocations, locationToPayload, normalizeUrl, postLocation, type PersonLocation } from './src/api';
 import { formatRelativeTime, formatSpeedSuffix } from './src/formatTime';
-import { isSharing, startSharing, stopSharing } from './src/locationTask';
-import { clearProfile, loadProfile, saveLastSentAt, saveProfile, type Profile } from './src/storage';
-import { POLL_INTERVAL_MS, TOKEN_MAX_LEN, TOKEN_MIN_LEN } from './src/config';
+import { isSharing, startQuickUpdates, startSharing, stopQuickUpdates, stopSharing } from './src/locationTask';
+import { clearProfile, loadProfile, loadQuickUntil, saveLastSent, saveProfile, type Profile } from './src/storage';
+import { POLL_INTERVAL_MS, QUICK_DEFAULT_MS, QUICK_DURATIONS, TOKEN_MAX_LEN, TOKEN_MIN_LEN } from './src/config';
 import { PeopleMap, type MapPerson } from './src/PeopleMap';
 
 export default function App() {
@@ -82,6 +82,29 @@ async function ensureForegroundPermission(): Promise<boolean> {
   if (fg.status === 'granted') return true;
   Alert.alert('Location permission needed', 'Enable location access to share your position.');
   return false;
+}
+
+// Turning sharing on (the switch or a quick update) needs foreground and then
+// background ("Always") location.
+async function ensureSharingPermissions(): Promise<boolean> {
+  if (!(await ensureForegroundPermission())) return false;
+  const bg = await Location.requestBackgroundPermissionsAsync();
+  if (bg.status === 'granted') return true;
+  Alert.alert(
+    'Background location needed',
+    'To keep sharing while the app is closed, allow location access "Always" in Settings.'
+  );
+  return false;
+}
+
+// How long the "✓ Sent" / "✗ Not sent" badge stays after "Send my location now" succeeds.
+const SENT_CONFIRM_MS = 12 * 1000;
+
+// "3:45 PM", without leaning on Intl (not every Hermes build has full locale data).
+function formatClock(ms: number): string {
+  const d = new Date(ms);
+  const h = d.getHours();
+  return `${h % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
 }
 
 // Whatever was thrown, produce something readable for an alert: an Error's
@@ -217,7 +240,19 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
   const [you, setYou] = useState<PersonLocation | null>(null);
   const [others, setOthers] = useState<PersonLocation[]>([]);
   const [busy, setBusy] = useState(false);
+  // Feedback next to "Send my location now": a spinner while it's working,
+  // then a green tick or red cross that clears itself after SENT_CONFIRM_MS.
+  const [sendStatus, setSendStatus] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle');
+  const sentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (sentTimer.current) clearTimeout(sentTimer.current);
+  }, []);
   const [now, setNow] = useState(Date.now());
+  // When quick updates end (ms since epoch), 0 if off. The background side
+  // ends them on its own once the time passes, so this is re-read from
+  // storage on every clock tick rather than trusted.
+  const [quickUntil, setQuickUntil] = useState(0);
+  const [quickMenuOpen, setQuickMenuOpen] = useState(false);
   // Android draws edge-to-edge, so the scroll content needs room for the
   // navigation bar or the last button sits underneath it.
   const insets = useSafeAreaInsets();
@@ -239,18 +274,28 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
 
   useEffect(() => {
     let active = true;
-    isSharing().then((v) => {
-      if (active) setSharing(v);
-    });
+    const syncState = () => {
+      isSharing().then((v) => {
+        if (active) setSharing(v);
+      });
+      loadQuickUntil().then((v) => {
+        if (active) setQuickUntil(v);
+      });
+    };
+    syncState();
     refresh();
 
     const poll = setInterval(refresh, POLL_INTERVAL_MS);
-    const clock = setInterval(() => setNow(Date.now()), 15_000);
+    const clock = setInterval(() => {
+      setNow(Date.now());
+      syncState();
+    }, 15_000);
     // Timers are paused while the app is backgrounded, so refresh as soon as
     // it comes back rather than showing stale positions until the next tick.
     const appState = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
         setNow(Date.now());
+        syncState();
         refresh();
       }
     });
@@ -267,20 +312,14 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     setBusy(true);
     try {
       if (value) {
-        if (!(await ensureForegroundPermission())) return;
-        const bg = await Location.requestBackgroundPermissionsAsync();
-        if (bg.status !== 'granted') {
-          Alert.alert(
-            'Background location needed',
-            'To keep sharing while the app is closed, allow location access "Always" in Settings.'
-          );
-          return;
-        }
+        if (!(await ensureSharingPermissions())) return;
         await startSharing();
         setSharing(true);
       } else {
+        // Also ends quick updates.
         await stopSharing();
         setSharing(false);
+        setQuickUntil(0);
       }
     } catch (err) {
       Alert.alert('Something went wrong', errorText(err));
@@ -289,19 +328,64 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     }
   }, []);
 
+  const startQuick = useCallback(async (durationMs: number) => {
+    setQuickMenuOpen(false);
+    setBusy(true);
+    try {
+      if (!(await ensureSharingPermissions())) return;
+      const until = await startQuickUpdates(durationMs);
+      setSharing(true);
+      setQuickUntil(until);
+      setNow(Date.now());
+    } catch (err) {
+      Alert.alert('Could not start quick updates', errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const stopQuick = useCallback(async () => {
+    setBusy(true);
+    try {
+      await stopQuickUpdates();
+      setQuickUntil(0);
+    } catch (err) {
+      Alert.alert('Could not stop quick updates', errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const quickOn = sharing && quickUntil > now;
+
   const sendNow = useCallback(async () => {
     setBusy(true);
+    if (sentTimer.current) clearTimeout(sentTimer.current);
+    setSendStatus('sending');
+    let sent = false;
     try {
       if (!(await ensureForegroundPermission())) return;
       const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-      await postLocation(profile.serverUrl, profile.token, locationToPayload(loc));
+      const payload = locationToPayload(loc);
+      await postLocation(profile.serverUrl, profile.token, payload);
       // Counts toward the 5-minute window, so the background task won't
       // follow a manual send with another post seconds later.
-      await saveLastSentAt(Date.now());
+      await saveLastSent(Date.now(), payload);
+      sent = true;
+      // Confirm as soon as the post lands; the refresh below can be slow.
+      setSendStatus('sent');
+      sentTimer.current = setTimeout(() => setSendStatus('idle'), SENT_CONFIRM_MS);
       await refresh();
     } catch (err) {
+      // A failed refresh after a successful post is still "sent"; refresh()
+      // swallows its own errors, so anything here is a failed send.
       Alert.alert('Could not send location', errorText(err));
     } finally {
+      // Also covers a refused permission (its own alert has already shown).
+      if (!sent) {
+        setSendStatus('failed');
+        sentTimer.current = setTimeout(() => setSendStatus('idle'), SENT_CONFIRM_MS);
+      }
       setBusy(false);
     }
   }, [profile, refresh]);
@@ -332,14 +416,74 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
           <Switch value={sharing} onValueChange={toggleSharing} disabled={busy} />
         </View>
         <Text style={styles.hint}>
-          {sharing
-            ? 'Sharing in the background, updating roughly every 5 minutes.'
-            : 'Not sharing. Turn this on so everyone else can see your location.'}
+          {quickOn
+            ? `Quick updates until ${formatClock(quickUntil)}: sending whenever you move (at most every 5 seconds, at least every 20).`
+            : sharing
+              ? 'Sharing in the background, updating every 5 minutes (even when you stay put).'
+              : 'Not sharing. Turn this on so everyone else can see your location.'}
         </Text>
 
-        <Pressable style={styles.linkButton} onPress={sendNow} disabled={busy}>
-          <Text style={styles.linkButtonText}>Send my location now</Text>
-        </Pressable>
+        <View style={styles.quickRow}>
+          {/* Split button: the label starts (or restarts) the 30-minute
+              default, the arrow opens the other durations. */}
+          <View style={[styles.quickButton, quickOn && styles.quickButtonOn]}>
+            <Pressable style={styles.quickButtonMain} onPress={() => startQuick(QUICK_DEFAULT_MS)} disabled={busy}>
+              <Text style={[styles.quickButtonText, quickOn && styles.quickButtonTextOn]}>
+                {quickOn ? `Quick update · until ${formatClock(quickUntil)}` : 'Quick update · 30 min'}
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[styles.quickButtonArrow, quickOn && styles.quickButtonArrowOn]}
+              onPress={() => setQuickMenuOpen((open) => !open)}
+              disabled={busy}
+              accessibilityLabel="Choose how long quick updates run"
+            >
+              <Text style={[styles.quickButtonText, quickOn && styles.quickButtonTextOn]}>
+                {quickMenuOpen ? '▴' : '▾'}
+              </Text>
+            </Pressable>
+          </View>
+          {quickOn && (
+            <Pressable style={styles.quickStop} onPress={stopQuick} disabled={busy}>
+              <Text style={styles.linkButtonText}>Stop</Text>
+            </Pressable>
+          )}
+        </View>
+        {quickMenuOpen && (
+          <View style={styles.quickMenu}>
+            {QUICK_DURATIONS.map((d) => (
+              <Pressable key={d.ms} style={styles.quickMenuItem} onPress={() => startQuick(d.ms)} disabled={busy}>
+                <Text style={styles.quickMenuText}>
+                  {d.label}
+                  {d.ms === QUICK_DEFAULT_MS ? ' (default)' : ''}
+                  <Text style={styles.quickMenuHint}>  until {formatClock(now + d.ms)}</Text>
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
+
+        <View style={styles.sendRow}>
+          <Pressable onPress={sendNow} disabled={busy}>
+            <Text style={styles.linkButtonText}>Send my location now</Text>
+          </Pressable>
+          {sendStatus === 'sending' && (
+            <View style={styles.sendStatus}>
+              <ActivityIndicator size="small" />
+              <Text style={styles.sendingText}>Sending…</Text>
+            </View>
+          )}
+          {sendStatus === 'sent' && (
+            <View style={[styles.sendStatus, styles.sentBadge]}>
+              <Text style={styles.sentText}>✓ Sent</Text>
+            </View>
+          )}
+          {sendStatus === 'failed' && (
+            <View style={[styles.sendStatus, styles.failedBadge]}>
+              <Text style={styles.failedText}>✗ Not sent</Text>
+            </View>
+          )}
+        </View>
 
         <View style={styles.divider} />
 
@@ -481,6 +625,106 @@ const styles = StyleSheet.create({
     color: '#2563eb',
     fontSize: 14,
     fontWeight: '600',
+  },
+  sendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 16,
+    minHeight: 28,
+  },
+  sendStatus: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 12,
+  },
+  sendingText: {
+    marginLeft: 6,
+    color: '#666',
+    fontSize: 13,
+  },
+  sentBadge: {
+    backgroundColor: '#dcfce7',
+    borderRadius: 12,
+    paddingVertical: 3,
+    paddingHorizontal: 10,
+  },
+  sentText: {
+    color: '#15803d',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  failedBadge: {
+    backgroundColor: '#fee2e2',
+    borderRadius: 12,
+    paddingVertical: 3,
+    paddingHorizontal: 10,
+  },
+  failedText: {
+    color: '#b91c1c',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  quickRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 16,
+  },
+  quickButton: {
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderColor: '#2563eb',
+    borderRadius: 8,
+  },
+  quickButtonMain: {
+    paddingVertical: 8,
+    paddingLeft: 14,
+    paddingRight: 10,
+  },
+  quickButtonArrow: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderLeftWidth: 1,
+    borderLeftColor: '#2563eb',
+  },
+  quickButtonArrowOn: {
+    borderLeftColor: '#fff',
+  },
+  quickButtonOn: {
+    backgroundColor: '#2563eb',
+  },
+  quickButtonText: {
+    color: '#2563eb',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  quickButtonTextOn: {
+    color: '#fff',
+  },
+  quickStop: {
+    marginLeft: 16,
+  },
+  quickMenu: {
+    marginTop: 6,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 8,
+    alignSelf: 'flex-start',
+    minWidth: 220,
+    backgroundColor: '#fff',
+  },
+  quickMenuItem: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#eee',
+  },
+  quickMenuText: {
+    fontSize: 15,
+    color: '#222',
+  },
+  quickMenuHint: {
+    fontSize: 13,
+    color: '#888',
   },
   divider: {
     height: 1,

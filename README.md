@@ -19,7 +19,9 @@ which is why an Apple Developer account is required for the iPhone side.
 1. Each phone runs the app configured with your server's URL and a secret
    token.
 2. Every ~5 minutes, the OS wakes the app in the background, it grabs a GPS
-   fix, and POSTs it to `/api/location`.
+   fix, and POSTs it to `/api/location` -- even when the phone hasn't moved,
+   so a recent "last seen" means the phone is alive and sharing. A **Quick
+   update** (5 min to 4 h) posts much more often for a while; see below.
 3. Any phone can GET `/api/locations` to see everyone else's last reported
    position and when it was last updated.
 4. Tapping a person's card opens their location in Google Maps.
@@ -260,6 +262,19 @@ person centred and re-centres whenever their position changes; your zoom
 level is left alone. With more people it frames everyone once, then stays
 wherever you pan; the ⌖ button re-frames everyone on demand.
 
+### Quick updates
+
+Tap **Quick update** on the main screen for 30 minutes of quick updates,
+or use its **▾** to pick another duration: 5 or 15 minutes, or 1, 2 or 4
+hours. Tapping it again while running restarts the 30 minutes from now. Until then the phone posts as soon as it has
+moved 10 m or more, but no more than once every 5 seconds, and at least once every
+~20 seconds even when standing still (as long as it has a connection;
+failed posts are retried every few seconds). It uses GPS rather than the
+cheaper wifi/cell fix, so it costs noticeably more battery. Picking a
+duration turns sharing on if it was off. When the time is up (or you tap
+**Stop**) it drops back to normal 5-minute updates and sharing stays on.
+Turning sharing off also ends quick updates.
+
 ### Getting "Always" location permission
 
 - **iOS**: The system dialog usually offers "Allow Once" / "Allow While
@@ -277,25 +292,30 @@ wherever you pan; the ⌖ button re-frames everyone on demand.
 
 ## Caveats
 
-- **iOS update cadence is best-effort, not exact.** Android honors the
-  5-minute timer precisely. iOS ignores the timer and hands the app a
-  location whenever it has one -- every few seconds when moving. The app
-  enforces the 5-minute spacing itself: it will not post twice within 5
-  minutes, whatever the OS delivers (a manual "Send my location now" also
-  starts a new 5-minute window). So the server sees the same cadence from
-  both platforms. The server also has its own backstop: a post within 60
-  seconds of the same person's previous one is acknowledged (`{"ok":true,
-  "throttled":true}`) but not stored, so an over-eager app build can't
-  flood the database. If an iPhone sits still for a long time iOS may deliver fewer
-  updates; that doesn't cost you anything in practice, because the last
-  reported location is still accurate.
+- **How the 5-minute cadence is enforced.** Android honors the 5-minute
+  timer precisely. iOS ignores the timer and hands the app a location
+  whenever it has one -- every few seconds when moving, and possibly not at
+  all when sitting still. The app enforces the spacing itself: it will not
+  post twice within 5 minutes, whatever the OS delivers (a manual "Send my
+  location now" also starts a new 5-minute window). If nothing has gone out
+  for 5 minutes 15 seconds (the OS went quiet), a 5-second app timer looks
+  up the position itself and posts it, so a sharing phone checks in every
+  ~5 minutes even when it's not moving. That timer only runs while the app
+  is alive in the background (which it is while location sharing is on);
+  if the OS kills the app outright, updates stop until the OS or the person
+  relaunches it. The server has its own backstop: a post within 2 seconds
+  of the same person's previous one is acknowledged (`{"ok":true,
+  "throttled":true}`) but not stored, so a runaway app build can't post
+  without limit.
 - **Tokens are the only security.** Anyone with a token can see (and spoof)
   that person's location. Keep them secret; don't commit `.env` or paste
   tokens anywhere public.
-- **Only the latest position is stored.** The `locations` table holds one
-  row per person, overwritten on every post -- there is no history, and
-  nothing to prune. The Apache access log keeps ~14 days of request lines
-  (Ubuntu's default logrotate) but, with the format above, no IPs.
+- **Only a short trail is stored.** The `locations` table holds one row per
+  person, overwritten on every post. `location_history` keeps the last 4
+  hours of posts (used to work out speed) and prunes anything older -- a
+  few thousand rows per person after a long quick update. The Apache
+  access log keeps ~14 days of request lines (Ubuntu's default logrotate)
+  but, with the format above, no IPs.
 - **This is not encrypted end-to-end** beyond standard HTTPS transport —
   the server operator can see everyone's location in the SQLite file.
   That's expected for a self-hosted tool for a small trusted group, just
