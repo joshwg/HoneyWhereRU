@@ -84,7 +84,7 @@ async function maybeSend(loc: Location.LocationObject | null): Promise<void> {
     const profile = await loadProfile();
     if (!profile) return; // not configured yet, nothing to send to
 
-    const payload = locationToPayload(loc);
+    const payload = locationToPayload(loc, mode === 'quick');
     await postLocation(profile.serverUrl, profile.token, payload);
     await saveLastSent(now, payload);
   } catch (err) {

@@ -32,6 +32,7 @@ func main() {
 	boxSize := flag.Float64("box", 0.5, "size in degrees of the (square) box to wander within, centered on -center-lat/-center-lng")
 	interval := flag.Duration("interval", 5*time.Minute, "how often to send a location update")
 	step := flag.Float64("step", 0.03, "max degrees to move (per axis) between updates")
+	quick := flag.Bool("quick", false, "flag each post as a quick update (pair with e.g. -interval 10s)")
 	flag.Parse()
 
 	if *token == "" {
@@ -60,7 +61,7 @@ func main() {
 		lng = bounce(lng+(rng.Float64()*2-1)*(*step), minLng, maxLng)
 		accuracy := 5 + rng.Float64()*15
 
-		if err := postLocation(ctx, client, *server, *token, lat, lng, accuracy); err != nil {
+		if err := postLocation(ctx, client, *server, *token, lat, lng, accuracy, *quick); err != nil {
 			log.Printf("failed to post location: %v", err)
 		} else {
 			log.Printf("sent location: %.5f, %.5f (accuracy %.1fm)", lat, lng, accuracy)
@@ -89,12 +90,13 @@ func bounce(v, min, max float64) float64 {
 	return v
 }
 
-func postLocation(ctx context.Context, client *http.Client, server, token string, lat, lng, accuracy float64) error {
+func postLocation(ctx context.Context, client *http.Client, server, token string, lat, lng, accuracy float64, quick bool) error {
 	body, err := json.Marshal(map[string]any{
 		"lat":       lat,
 		"lng":       lng,
 		"accuracy":  accuracy,
 		"timestamp": time.Now().UnixMilli(),
+		"quick":     quick,
 	})
 	if err != nil {
 		return err

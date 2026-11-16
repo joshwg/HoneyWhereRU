@@ -20,7 +20,7 @@ import { fetchLocations, locationToPayload, normalizeUrl, postLocation, type Per
 import { formatRelativeTime, formatSpeedSuffix } from './src/formatTime';
 import { isSharing, startQuickUpdates, startSharing, stopQuickUpdates, stopSharing } from './src/locationTask';
 import { clearProfile, loadProfile, loadQuickUntil, saveLastSent, saveProfile, type Profile } from './src/storage';
-import { POLL_INTERVAL_MS, QUICK_DEFAULT_MS, QUICK_DURATIONS, TOKEN_MAX_LEN, TOKEN_MIN_LEN } from './src/config';
+import { POLL_INTERVAL_MS, QUICK_DEFAULT_MS, QUICK_POLL_INTERVAL_MS, QUICK_DURATIONS, TOKEN_MAX_LEN, TOKEN_MIN_LEN } from './src/config';
 import { PeopleMap, type MapPerson } from './src/PeopleMap';
 
 export default function App() {
@@ -97,6 +97,9 @@ async function ensureSharingPermissions(): Promise<boolean> {
   return false;
 }
 
+// Marks a person on quick updates, on the map and their card.
+const QUICK_MARK = '⚡';
+
 // How long the "✓ Sent" / "✗ Not sent" badge stays after "Send my location now" succeeds.
 const SENT_CONFIRM_MS = 12 * 1000;
 
@@ -142,6 +145,12 @@ function SetupScreen({
     if (!p.serverUrl || !p.token) {
       Alert.alert('Missing info', 'Enter both the server URL and your token.');
       return;
+    }
+    // A bare host like "whereru.example.com" (no scheme at all) gets https://
+    // added; anything with a scheme (e.g. http://) is left to fail the check below.
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(p.serverUrl) && /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?(\/.*)?$/i.test(p.serverUrl)) {
+      p.serverUrl = `https://${p.serverUrl}`;
+      setServerUrl(p.serverUrl);
     }
     if (!/^https:\/\//i.test(p.serverUrl)) {
       Alert.alert('Check the server URL', 'The server URL must start with https://');
@@ -265,6 +274,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     try {
       const res = await fetchLocations(profile.serverUrl, profile.token);
       if (id !== latestRequest.current) return;
+      setNow(Date.now()); // keep "last seen" labels in step with fast polls
       setYou(res.you);
       setOthers([...res.others].sort((a, b) => b.updatedAt - a.updatedAt));
     } catch (err) {
@@ -285,7 +295,6 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     syncState();
     refresh();
 
-    const poll = setInterval(refresh, POLL_INTERVAL_MS);
     const clock = setInterval(() => {
       setNow(Date.now());
       syncState();
@@ -302,7 +311,6 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     return () => {
       active = false;
       latestRequest.current++; // drop any in-flight response
-      clearInterval(poll);
       clearInterval(clock);
       appState.remove();
     };
@@ -358,6 +366,14 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
 
   const quickOn = sharing && quickUntil > now;
 
+  // Poll every 5 seconds while anyone (this phone included) is on quick
+  // updates, otherwise once a minute. The initial fetch happens above.
+  const fastPoll = quickOn || !!you?.quick || others.some((p) => p.quick);
+  useEffect(() => {
+    const poll = setInterval(refresh, fastPoll ? QUICK_POLL_INTERVAL_MS : POLL_INTERVAL_MS);
+    return () => clearInterval(poll);
+  }, [refresh, fastPoll]);
+
   const sendNow = useCallback(async () => {
     setBusy(true);
     if (sentTimer.current) clearTimeout(sentTimer.current);
@@ -366,7 +382,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     try {
       if (!(await ensureForegroundPermission())) return;
       const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-      const payload = locationToPayload(loc);
+      const payload = locationToPayload(loc, (await loadQuickUntil()) > Date.now());
       await postLocation(profile.serverUrl, profile.token, payload);
       // Counts toward the 5-minute window, so the background task won't
       // follow a manual send with another post seconds later.
@@ -393,10 +409,10 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
   const mapPeople = useMemo<MapPerson[]>(() => {
     const list: MapPerson[] = others.map((p) => ({
       ...p,
-      label: `${p.name} · ${formatRelativeTime(p.updatedAt, now)}${formatSpeedSuffix(p.speedMph)}`,
+      label: `${p.quick ? `${QUICK_MARK} ` : ''}${p.name} · ${formatRelativeTime(p.updatedAt, now)}${formatSpeedSuffix(p.speedMph)}`,
       isYou: false,
     }));
-    if (you) list.push({ ...you, label: 'You', isYou: true });
+    if (you) list.push({ ...you, label: you.quick ? `${QUICK_MARK} You` : 'You', isYou: true });
     return list;
   }, [you, others, now]);
 
@@ -493,6 +509,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
             <PersonCard
               key={person.name}
               title={person.name}
+              quick={person.quick}
               body={`Last seen ${formatRelativeTime(person.updatedAt, now)}${formatSpeedSuffix(person.speedMph)}`}
               spaced
               onPress={() => openInMaps(person.lat, person.lng)}
@@ -506,6 +523,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
         {you ? (
           <PersonCard
             title={`Last sent ${formatRelativeTime(you.updatedAt, now)}${formatSpeedSuffix(you.speedMph)}`}
+            quick={you.quick}
             body={`${you.lat.toFixed(5)}, ${you.lng.toFixed(5)}${
               you.accuracy != null ? ` (±${Math.round(you.accuracy)} m)` : ''
             }`}
@@ -528,17 +546,26 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
 function PersonCard({
   title,
   body,
+  quick,
   spaced,
   onPress,
 }: {
   title: string;
   body: string;
+  quick?: boolean;
   spaced?: boolean;
   onPress: () => void;
 }) {
   return (
     <Pressable style={[styles.card, spaced && styles.cardSpaced]} onPress={onPress}>
-      <Text style={styles.cardTitle}>{title}</Text>
+      <View style={styles.cardTitleRow}>
+        <Text style={styles.cardTitle}>{title}</Text>
+        {quick && (
+          <View style={styles.quickBadge}>
+            <Text style={styles.quickBadgeText}>{QUICK_MARK} Quick updates</Text>
+          </View>
+        )}
+      </View>
       <Text style={styles.cardBody}>{body}</Text>
       <Text style={styles.cardHint}>Tap to open in Maps</Text>
     </Pressable>
@@ -747,8 +774,25 @@ const styles = StyleSheet.create({
   cardSpaced: {
     marginBottom: 10,
   },
+  cardTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+  },
   cardTitle: {
     fontSize: 16,
+    fontWeight: '700',
+  },
+  quickBadge: {
+    marginLeft: 8,
+    backgroundColor: '#fef3c7',
+    borderRadius: 10,
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+  },
+  quickBadgeText: {
+    color: '#b45309',
+    fontSize: 12,
     fontWeight: '700',
   },
   cardBody: {

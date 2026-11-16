@@ -12,6 +12,9 @@ export type PersonLocation = {
   // (or absent, from an older server) when it isn't known or the latest
   // position is too old to say how fast they're going now.
   speedMph?: number | null;
+  // True while this person's phone is on quick updates (the server drops it
+  // a minute after their last quick post). Absent from an older server.
+  quick?: boolean;
 };
 
 export type LocationsResponse = {
@@ -24,6 +27,8 @@ export type LocationPayload = {
   lng: number;
   accuracy: number | null;
   timestamp: number;
+  // Tells everyone else this phone is on quick updates, so they poll faster.
+  quick: boolean;
 };
 
 export function normalizeUrl(url: string): string {
@@ -33,7 +38,7 @@ export function normalizeUrl(url: string): string {
 // The shape the server expects, built from what expo-location gives us.
 // iOS reports a negative accuracy when it doesn't trust the fix yet; send
 // that as "unknown" rather than a value the server would reject.
-export function locationToPayload(loc: Location.LocationObject): LocationPayload {
+export function locationToPayload(loc: Location.LocationObject, quick: boolean): LocationPayload {
   const acc = loc.coords.accuracy;
   return {
     lat: loc.coords.latitude,
@@ -41,6 +46,7 @@ export function locationToPayload(loc: Location.LocationObject): LocationPayload
     accuracy: acc != null && Number.isFinite(acc) && acc >= 0 ? acc : null,
     // iOS gives fractional milliseconds; the server stores whole ones.
     timestamp: Math.round(loc.timestamp),
+    quick,
   };
 }
 

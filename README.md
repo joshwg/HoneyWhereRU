@@ -275,6 +275,16 @@ duration turns sharing on if it was off. When the time is up (or you tap
 **Stop**) it drops back to normal 5-minute updates and sharing stays on.
 Turning sharing off also ends quick updates.
 
+Each post carries a `quick` flag, and the server reports it back per
+person (`"quick": true` in `/api/locations`) for as long as their quick
+posts keep arriving -- it lapses a minute after the last one. Anyone on
+quick updates gets a ⚡ on the map and a **⚡ Quick updates** badge on
+their card, and while you or anyone else is on quick updates the open app
+re-fetches positions every 5 seconds instead of every minute. Their speed
+is also worked out over roughly the last minute (10-second stretches)
+instead of the last several 5-minute posts, so it keeps up when they speed
+up or slow down.
+
 ### Getting "Always" location permission
 
 - **iOS**: The system dialog usually offers "Allow Once" / "Allow While

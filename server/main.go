@@ -88,15 +88,30 @@ const (
 	historyPruneEvery = 10 * time.Minute
 )
 
-// Speed is an EWMA of the newest speedPoints-1 usable segments in each
-// person's recent history rows (at most speedFetchRows of them), oldest to
-// newest, with the usual N-period weight alpha = 2/(N+1). It's not the
-// phone's instantaneous GPS speed, which iOS often omits in the background.
+// A person is reported as on quick updates ("quick": true) only while their
+// latest post said so and arrived within quickFreshFor. Quick-update phones
+// post at least every ~20 seconds, so a phone that has stopped quick updates
+// (or gone silent) drops the flag within a minute even though its next normal
+// post may be 5 minutes away.
+const quickFreshFor = 60 * time.Second
+
+// Speed is an EWMA of the newest points-1 usable segments in each person's
+// recent history rows (at most speedFetchRows of them), oldest to newest,
+// with the usual N-period weight alpha = 2/(N+1). It's not the phone's
+// instantaneous GPS speed, which iOS often omits in the background.
+//
+// Two sets of settings (speedParams), picked by whether the person's newest
+// row was a quick update:
+//   - normal (posts every 5 minutes): 30 s minimum segments, 10 points, so
+//     the average spans the last several posts;
+//   - quick (a GPS post every 5-20 s): 10 s minimum segments, 6 points, so
+//     the figure reflects roughly the last minute instead of lagging minutes
+//     behind a change of speed.
 //
 // Per segment:
-//   - closer than speedMinGap apart in time: the newer row is skipped and the
+//   - closer than minGap apart in time: the newer row is skipped and the
 //     segment start stays put, so quick updates (a post every few seconds)
-//     are measured over ~speedMinGap stretches instead of being dropped,
+//     are measured over ~minGap stretches instead of being dropped,
 //   - further than speedMaxGap apart: the run is broken there and everything
 //     older is discarded, so a trip from before a long stop doesn't leak in,
 //   - above speedMaxMph: skipped as a bad fix, not real movement,
@@ -111,12 +126,19 @@ const (
 //
 // The result is null when the latest post is older than speedMaxAge (they may
 // have stopped since) or no usable segment is left.
+type speedParams struct {
+	points int           // EWMA period; uses the newest points-1 segments
+	minGap time.Duration // shortest segment measured
+}
+
+var (
+	normalSpeed = speedParams{points: 10, minGap: 30 * time.Second}
+	quickSpeed  = speedParams{points: 6, minGap: 10 * time.Second}
+)
+
 const (
-	speedPoints     = 10
 	speedFetchRows  = 120 // 10 minutes of quick updates at one post per 5 s
-	speedAlpha      = 2.0 / (speedPoints + 1)
 	speedMaxAge     = 15 * time.Minute
-	speedMinGap     = 30 * time.Second
 	speedMaxGap     = 20 * time.Minute
 	speedMaxMph     = 700.0
 	defaultAccuracy = 20.0 // metres, assumed when a fix has no accuracy
@@ -132,6 +154,7 @@ type location struct {
 	Timestamp int64    `json:"timestamp"`
 	UpdatedAt int64    `json:"updatedAt"`
 	SpeedMph  *float64 `json:"speedMph"`
+	Quick     bool     `json:"quick"`
 }
 
 // haversineMetres is the great-circle distance between two points.
@@ -147,13 +170,13 @@ func haversineMetres(lat1, lng1, lat2, lng2 float64) float64 {
 // segmentMph is the speed in mph from prev to cur. ok is false when the
 // segment should be skipped; brk is true when the gap is long enough that
 // everything before it should be dropped.
-func segmentMph(prev, cur location) (mph float64, ok, brk bool) {
+func segmentMph(prev, cur location, minGap time.Duration) (mph float64, ok, brk bool) {
 	// Fix times from the same phone, so any clock offset cancels out.
 	dtMs := cur.Timestamp - prev.Timestamp
 	if dtMs > speedMaxGap.Milliseconds() {
 		return 0, false, true
 	}
-	if dtMs < speedMinGap.Milliseconds() {
+	if dtMs < minGap.Milliseconds() {
 		return 0, false, false
 	}
 	acc := func(a *float64) float64 {
@@ -173,25 +196,30 @@ func segmentMph(prev, cur location) (mph float64, ok, brk bool) {
 }
 
 // ewmaSpeed returns the smoothed speed in mph over points (oldest first), or
-// nil if it can't be trusted (see the rules above speedPoints). nowMs is the
+// nil if it can't be trusted (see the rules above speedParams). nowMs is the
 // server clock, compared with updated_at (also server clock).
 func ewmaSpeed(points []location, nowMs int64) *float64 {
 	if len(points) < 2 || nowMs-points[len(points)-1].UpdatedAt > speedMaxAge.Milliseconds() {
 		return nil
 	}
+	p := normalSpeed
+	if points[len(points)-1].Quick {
+		p = quickSpeed
+	}
+	alpha := 2.0 / float64(p.points+1)
 	// Collect usable segments, oldest first. start is the row the next
 	// segment is measured from; it only moves on once a segment is
 	// complete (long enough, or a break), so short gaps accumulate.
 	var segs []float64
 	start := points[0]
 	for _, cur := range points[1:] {
-		mph, ok, brk := segmentMph(start, cur)
+		mph, ok, brk := segmentMph(start, cur, p.minGap)
 		if brk {
 			segs = segs[:0]
 			start = cur
 			continue
 		}
-		if cur.Timestamp-start.Timestamp < speedMinGap.Milliseconds() {
+		if cur.Timestamp-start.Timestamp < p.minGap.Milliseconds() {
 			continue // too short yet: keep measuring from start
 		}
 		start = cur
@@ -202,12 +230,12 @@ func ewmaSpeed(points []location, nowMs int64) *float64 {
 	if len(segs) == 0 {
 		return nil
 	}
-	if len(segs) > speedPoints-1 {
-		segs = segs[len(segs)-(speedPoints-1):]
+	if len(segs) > p.points-1 {
+		segs = segs[len(segs)-(p.points-1):]
 	}
 	ewma := segs[0]
 	for _, mph := range segs[1:] {
-		ewma = speedAlpha*mph + (1-speedAlpha)*ewma
+		ewma = alpha*mph + (1-alpha)*ewma
 	}
 	if segs[len(segs)-1] == 0 {
 		ewma = 0
@@ -219,7 +247,7 @@ func ewmaSpeed(points []location, nowMs int64) *float64 {
 // speedFetchRows history rows; people without a trustworthy speed are absent.
 func (s *server) recentSpeeds(nowMs int64) (map[string]float64, error) {
 	rows, err := s.db.Query(`
-		SELECT name, lat, lng, accuracy, timestamp, updated_at FROM (
+		SELECT name, lat, lng, accuracy, timestamp, updated_at, quick FROM (
 			SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY updated_at DESC, id DESC) AS rn
 			FROM location_history
 		) WHERE rn <= ?
@@ -234,7 +262,7 @@ func (s *server) recentSpeeds(nowMs int64) (map[string]float64, error) {
 	byName := map[string][]location{}
 	for rows.Next() {
 		var loc location
-		if err := rows.Scan(&loc.Name, &loc.Lat, &loc.Lng, &loc.Accuracy, &loc.Timestamp, &loc.UpdatedAt); err != nil {
+		if err := rows.Scan(&loc.Name, &loc.Lat, &loc.Lng, &loc.Accuracy, &loc.Timestamp, &loc.UpdatedAt, &loc.Quick); err != nil {
 			return nil, err
 		}
 		byName[loc.Name] = append(byName[loc.Name], loc)
@@ -259,6 +287,8 @@ type locationPost struct {
 	// float64, not int64: iOS sends milliseconds with a fractional part
 	// (e.g. 1793990414242.857), which Go refuses to decode into an integer.
 	Timestamp *float64 `json:"timestamp"`
+	// True while the phone is on quick updates; absent (false) from older apps.
+	Quick bool `json:"quick"`
 }
 
 // validate returns a human-readable problem with the posted coordinates, or
@@ -432,16 +462,17 @@ func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, user
 	defer tx.Rollback() // no-op once committed
 
 	res, err := tx.Exec(`
-		INSERT INTO locations (name, lat, lng, accuracy, timestamp, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO locations (name, lat, lng, accuracy, timestamp, updated_at, quick)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			lat = excluded.lat,
 			lng = excluded.lng,
 			accuracy = excluded.accuracy,
 			timestamp = excluded.timestamp,
-			updated_at = excluded.updated_at
+			updated_at = excluded.updated_at,
+			quick = excluded.quick
 		WHERE excluded.updated_at - locations.updated_at >= ?
-	`, userName, *body.Lat, *body.Lng, body.Accuracy, timestamp, now, minPostGap.Milliseconds())
+	`, userName, *body.Lat, *body.Lng, body.Accuracy, timestamp, now, body.Quick, minPostGap.Milliseconds())
 	if err != nil {
 		log.Printf("failed to upsert location: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to store location")
@@ -457,9 +488,9 @@ func (s *server) handlePostLocation(w http.ResponseWriter, r *http.Request, user
 	// Only posts that passed the rate limit reach the history, so it gets
 	// the same rhythm as the latest-position table.
 	if _, err := tx.Exec(`
-		INSERT INTO location_history (name, lat, lng, accuracy, timestamp, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, userName, *body.Lat, *body.Lng, body.Accuracy, timestamp, now); err != nil {
+		INSERT INTO location_history (name, lat, lng, accuracy, timestamp, updated_at, quick)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, userName, *body.Lat, *body.Lng, body.Accuracy, timestamp, now, body.Quick); err != nil {
 		log.Printf("failed to insert location history: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to store location")
 		return
@@ -483,12 +514,13 @@ func (s *server) handleGetLocations(w http.ResponseWriter, r *http.Request, user
 	// Speed is a nice-to-have: if it fails, still return the positions. Run
 	// before the main query: the pool has one connection, so a second query
 	// while those rows are open would wait forever.
-	speeds, err := s.recentSpeeds(time.Now().UnixMilli())
+	nowMs := time.Now().UnixMilli()
+	speeds, err := s.recentSpeeds(nowMs)
 	if err != nil {
 		log.Printf("failed to compute speeds: %v", err)
 	}
 
-	rows, err := s.db.Query(`SELECT name, lat, lng, accuracy, timestamp, updated_at FROM locations`)
+	rows, err := s.db.Query(`SELECT name, lat, lng, accuracy, timestamp, updated_at, quick FROM locations`)
 	if err != nil {
 		log.Printf("failed to query locations: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to load locations")
@@ -500,7 +532,8 @@ func (s *server) handleGetLocations(w http.ResponseWriter, r *http.Request, user
 	others := []location{}
 	for rows.Next() {
 		var loc location
-		if err := rows.Scan(&loc.Name, &loc.Lat, &loc.Lng, &loc.Accuracy, &loc.Timestamp, &loc.UpdatedAt); err != nil {
+		var quick bool
+		if err := rows.Scan(&loc.Name, &loc.Lat, &loc.Lng, &loc.Accuracy, &loc.Timestamp, &loc.UpdatedAt, &quick); err != nil {
 			log.Printf("failed to scan location row: %v", err)
 			writeError(w, http.StatusInternalServerError, "failed to load locations")
 			return
@@ -508,6 +541,7 @@ func (s *server) handleGetLocations(w http.ResponseWriter, r *http.Request, user
 		if mph, ok := speeds[loc.Name]; ok {
 			loc.SpeedMph = &mph
 		}
+		loc.Quick = quick && nowMs-loc.UpdatedAt <= quickFreshFor.Milliseconds()
 		if loc.Name == userName {
 			you = &loc
 		} else {
@@ -545,7 +579,8 @@ func openDB(dbPath string) (*sql.DB, error) {
 			lng REAL NOT NULL,
 			accuracy REAL,
 			timestamp INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
+			updated_at INTEGER NOT NULL,
+			quick INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE IF NOT EXISTS location_history (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -554,16 +589,37 @@ func openDB(dbPath string) (*sql.DB, error) {
 			lng REAL NOT NULL,
 			accuracy REAL,
 			timestamp INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
+			updated_at INTEGER NOT NULL,
+			quick INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS location_history_updated_at ON location_history (updated_at);
 		CREATE INDEX IF NOT EXISTS location_history_name_updated_at ON location_history (name, updated_at);
 	`)
+	if err == nil {
+		err = addColumnIfMissing(db, "locations", "quick", "INTEGER NOT NULL DEFAULT 0")
+	}
+	if err == nil {
+		err = addColumnIfMissing(db, "location_history", "quick", "INTEGER NOT NULL DEFAULT 0")
+	}
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// addColumnIfMissing adds a column to a table created by an older server
+// version (CREATE TABLE IF NOT EXISTS leaves an existing table as it was).
+func addColumnIfMissing(db *sql.DB, table, column, decl string) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + decl)
+	return err
 }
 
 // pruneHistory deletes history rows older than historyRetention.

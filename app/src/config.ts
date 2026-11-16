@@ -56,6 +56,8 @@ export const HEARTBEAT_FIX_MAX_AGE_MS = 60 * 1000;
 
 // How often the foregrounded app re-checks everyone else's last known spot.
 export const POLL_INTERVAL_MS = 60 * 1000;
+// ...and how often while this phone or anyone else is on quick updates.
+export const QUICK_POLL_INTERVAL_MS = 5 * 1000;
 
 // Give up on a server request after this long. Matters most in the
 // background task, where a hung request would otherwise keep the task alive
