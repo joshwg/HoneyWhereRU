@@ -195,6 +195,19 @@ on its servers (`"appVersionSource": "remote"` in `eas.json`) and bumped
 automatically on every build. The version people see comes from `VERSION`
 (see "Versioning" above). Phones and tablets are both supported.
 
+`app/build.sh` wraps the commands below:
+
+```bash
+./build.sh                    # Android + iOS, preview (installed from the EAS link)
+./build.sh --android          # or --ios: one platform only
+./build.sh --testflight       # iOS for TestFlight, uploaded automatically
+./build.sh --testflight --android --what-to-test "What changed"
+```
+
+`./testflight_build.sh ["What changed"]` is a shortcut for `--testflight`.
+Each platform is a separate `eas build` so the CLI shows the queue position
+and estimated wait (it only does that when following a single build).
+
 ### Android (APK, installed directly)
 
 ```bash

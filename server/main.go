@@ -95,45 +95,51 @@ const (
 // post may be 5 minutes away.
 const quickFreshFor = 60 * time.Second
 
-// Speed is an EWMA of the newest points-1 usable segments in each person's
-// recent history rows (at most speedFetchRows of them), oldest to newest,
-// with the usual N-period weight alpha = 2/(N+1). It's not the phone's
-// instantaneous GPS speed, which iOS often omits in the background.
+// Speed comes from the person's recent history rows (at most speedFetchRows
+// of them), oldest to newest, cut into segments and smoothed with an EWMA
+// over the newest points-1 segments (the usual N-period weight alpha =
+// 2/(N+1)). It's not the phone's instantaneous GPS speed, which iOS often
+// omits in the background.
 //
 // Two sets of settings (speedParams), picked by whether the person's newest
 // row was a quick update:
-//   - normal (posts every 5 minutes): 30 s minimum segments, 10 points, so
-//     the average spans the last several posts;
-//   - quick (a GPS post every 5-20 s): 10 s minimum segments, 6 points, so
-//     the figure reflects roughly the last minute instead of lagging minutes
-//     behind a change of speed.
+//   - normal (a post every 5 minutes): each post-to-post segment is already a
+//     5-minute average, so the newest segment alone is the speed. Averaging
+//     several of them made the figure lag the real speed by half an hour
+//     (still "21 mph" ten minutes after getting out of the car).
+//   - quick (a GPS post every 5-17 s): segments of at least 10 s, averaged
+//     over the last two, so the figure follows a change of speed within
+//     about half a minute.
 //
-// Per segment:
-//   - closer than minGap apart in time: the newer row is skipped and the
-//     segment start stays put, so quick updates (a post every few seconds)
-//     are measured over ~minGap stretches instead of being dropped,
+// Per segment, measured from start (the row where the last one ended):
+//   - closer than minGap apart in time: the newer row is skipped and start
+//     stays put, so quick updates (a post every few seconds) are measured
+//     over ~minGap stretches instead of being dropped;
+//   - a move no bigger than the two fixes' combined accuracy is GPS jitter,
+//     not movement yet: the segment keeps stretching until the move is
+//     clear of the jitter or stillAfter has passed, and only then counts as
+//     0. Without the stretch a 2 mph walk (9 m in 10 s against 20 m of
+//     jitter) read as standing still;
 //   - further than speedMaxGap apart: the run is broken there and everything
-//     older is discarded, so a trip from before a long stop doesn't leak in,
-//   - above speedMaxMph: skipped as a bad fix, not real movement,
-//   - a move smaller than the two fixes' combined accuracy counts as 0 (GPS
-//     jitter, not movement).
+//     older is discarded, so a trip from before a long stop doesn't leak in;
+//   - above speedMaxMph: skipped as a bad fix, not real movement.
 //
-// If the newest usable segment is 0 (no movement beyond GPS jitter), the
-// result is 0 rather than the EWMA: otherwise someone who just parked would
-// show a decaying speed (~16 mph after 15 min stopped from 30 mph) for half
-// an hour. The EWMA itself isn't reset, so a single stop at a red light
-// doesn't throw away the smoothing once they move again.
+// If the newest segment is 0, the result is 0 rather than the EWMA, so
+// someone who has just stopped shows "not moving" straight away. The EWMA
+// itself isn't reset, so a stop at a red light doesn't throw away the
+// smoothing once they move again.
 //
 // The result is null when the latest post is older than speedMaxAge (they may
 // have stopped since) or no usable segment is left.
 type speedParams struct {
-	points int           // EWMA period; uses the newest points-1 segments
-	minGap time.Duration // shortest segment measured
+	points     int           // EWMA period; uses the newest points-1 segments
+	minGap     time.Duration // shortest segment measured
+	stillAfter time.Duration // a segment still within GPS jitter after this long counts as 0
 }
 
 var (
-	normalSpeed = speedParams{points: 10, minGap: 30 * time.Second}
-	quickSpeed  = speedParams{points: 6, minGap: 10 * time.Second}
+	normalSpeed = speedParams{points: 2, minGap: 30 * time.Second, stillAfter: 30 * time.Second}
+	quickSpeed  = speedParams{points: 3, minGap: 10 * time.Second, stillAfter: 30 * time.Second}
 )
 
 const (
@@ -167,17 +173,26 @@ func haversineMetres(lat1, lng1, lat2, lng2 float64) float64 {
 	return 2 * earthRadiusM * math.Asin(math.Min(1, math.Sqrt(a)))
 }
 
-// segmentMph is the speed in mph from prev to cur. ok is false when the
-// segment should be skipped; brk is true when the gap is long enough that
-// everything before it should be dropped.
-func segmentMph(prev, cur location, minGap time.Duration) (mph float64, ok, brk bool) {
+// segment outcomes from measureSegment.
+type segResult int
+
+const (
+	segWait  segResult = iota // not finished yet: keep measuring from start
+	segDone                   // finished: mph is the speed over it
+	segSkip                   // finished but unusable (a bad fix)
+	segBreak                  // gap too long: drop everything before cur
+)
+
+// measureSegment decides what the stretch from start to cur amounts to (see
+// the rules above speedParams).
+func measureSegment(start, cur location, p speedParams) (float64, segResult) {
 	// Fix times from the same phone, so any clock offset cancels out.
-	dtMs := cur.Timestamp - prev.Timestamp
+	dtMs := cur.Timestamp - start.Timestamp
 	if dtMs > speedMaxGap.Milliseconds() {
-		return 0, false, true
+		return 0, segBreak
 	}
-	if dtMs < minGap.Milliseconds() {
-		return 0, false, false
+	if dtMs < p.minGap.Milliseconds() {
+		return 0, segWait
 	}
 	acc := func(a *float64) float64 {
 		if a == nil {
@@ -185,14 +200,18 @@ func segmentMph(prev, cur location, minGap time.Duration) (mph float64, ok, brk 
 		}
 		return *a
 	}
-	dist := haversineMetres(prev.Lat, prev.Lng, cur.Lat, cur.Lng)
-	if dist > acc(prev.Accuracy)+acc(cur.Accuracy) {
-		mph = dist / (float64(dtMs) / 1000) / metresPerMile * 3600
+	dist := haversineMetres(start.Lat, start.Lng, cur.Lat, cur.Lng)
+	if dist <= acc(start.Accuracy)+acc(cur.Accuracy) {
+		if dtMs < p.stillAfter.Milliseconds() {
+			return 0, segWait
+		}
+		return 0, segDone
 	}
+	mph := dist / (float64(dtMs) / 1000) / metresPerMile * 3600
 	if mph > speedMaxMph {
-		return 0, false, false
+		return 0, segSkip
 	}
-	return mph, true, false
+	return mph, segDone
 }
 
 // ewmaSpeed returns the smoothed speed in mph over points (oldest first), or
@@ -207,25 +226,20 @@ func ewmaSpeed(points []location, nowMs int64) *float64 {
 		p = quickSpeed
 	}
 	alpha := 2.0 / float64(p.points+1)
-	// Collect usable segments, oldest first. start is the row the next
-	// segment is measured from; it only moves on once a segment is
-	// complete (long enough, or a break), so short gaps accumulate.
+	// Collect usable segments, oldest first.
 	var segs []float64
 	start := points[0]
 	for _, cur := range points[1:] {
-		mph, ok, brk := segmentMph(start, cur, p.minGap)
-		if brk {
-			segs = segs[:0]
-			start = cur
+		mph, res := measureSegment(start, cur, p)
+		switch res {
+		case segWait:
 			continue
-		}
-		if cur.Timestamp-start.Timestamp < p.minGap.Milliseconds() {
-			continue // too short yet: keep measuring from start
-		}
-		start = cur
-		if ok {
+		case segBreak:
+			segs = segs[:0]
+		case segDone:
 			segs = append(segs, mph)
 		}
+		start = cur
 	}
 	if len(segs) == 0 {
 		return nil

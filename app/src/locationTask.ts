@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import {
@@ -6,6 +7,7 @@ import {
   HEARTBEAT_TICK_MS,
   LOCATION_TASK_NAME,
   MIN_SEND_GAP_MS,
+  NORMAL_DISTANCE_METRES_IOS,
   QUICK_FIX_INTERVAL_MS,
   QUICK_MAX_GAP_MS,
   QUICK_MIN_GAP_MS,
@@ -42,15 +44,30 @@ TaskManager.defineTask(LOCATION_TASK_NAME, async ({ data, error }) => {
   await maybeSend(latest);
 });
 
-// The OS only calls the task above when it has a new fix, and iOS stops
-// delivering them when the phone sits still. This timer is the backstop: if
-// nothing has gone out for too long (5 minutes normally, ~17 seconds during
-// quick updates) it looks up a position itself and posts it, so the server
-// always has a recent "still here" from a sharing phone. JS keeps running in
-// the background while location updates are active (that's what the
-// background location mode / Android foreground service are for), so the
-// timer keeps ticking there too.
+// The OS only calls the task above when it has a new fix, and in normal mode
+// iOS delivers none while the phone sits still (see
+// NORMAL_DISTANCE_METRES_IOS). This timer is the backstop: if nothing has
+// gone out for too long (5 minutes normally, ~17 seconds during quick
+// updates) it looks up a position itself and posts it, so the server always
+// has a recent "still here" from a sharing phone. JS keeps running in the
+// background while location updates are active (that's what the background
+// location mode / Android foreground service are for), so the timer keeps
+// ticking there too.
+//
+// The tick runs every 5 seconds around the clock, so it first checks the
+// copies below instead of reading storage each time. They're only a filter:
+// once they say a heartbeat may be due, maybeSend reads the stored values,
+// which are what count. Anything else that posts (the "Send now" button)
+// only makes the copy too old, which costs one storage read to correct.
+let knownLastSentAt: number | null = null; // null: not read yet
+let knownQuickUntil: number | null = null; // 0: quick updates off
+
 setInterval(() => {
+  if (knownLastSentAt !== null && knownQuickUntil !== null) {
+    const now = Date.now();
+    const overdue = now < knownQuickUntil ? QUICK_MAX_GAP_MS : HEARTBEAT_GAP_MS;
+    if (now - knownLastSentAt < overdue) return;
+  }
   maybeSend(null);
 }, HEARTBEAT_TICK_MS);
 
@@ -67,6 +84,7 @@ async function maybeSend(loc: Location.LocationObject | null): Promise<void> {
     const now = Date.now();
     const mode = await currentMode(now);
     const last = await loadLastSent();
+    knownLastSentAt = last.at;
 
     if (loc) {
       if (!shouldSendFix(loc, mode, last, now)) return;
@@ -87,6 +105,7 @@ async function maybeSend(loc: Location.LocationObject | null): Promise<void> {
     const payload = locationToPayload(loc, mode === 'quick');
     await postLocation(profile.serverUrl, profile.token, payload);
     await saveLastSent(now, payload);
+    knownLastSentAt = now;
   } catch (err) {
     // Not recorded as sent, so the next fix or heartbeat retries. With no
     // connectivity that's every few seconds, but each try is cheap and fails
@@ -160,9 +179,11 @@ function distanceMetres(lat1: number, lng1: number, lat2: number, lng2: number):
 // the normal, battery-friendly settings.
 async function currentMode(now: number): Promise<Mode> {
   const until = await loadQuickUntil();
+  knownQuickUntil = until;
   if (!until) return 'normal';
   if (now < until) return 'quick';
   await clearQuickUntil();
+  knownQuickUntil = 0;
   if (await isSharing()) await applyMode('normal');
   return 'normal';
 }
@@ -175,14 +196,17 @@ function taskOptions(mode: Mode): Location.LocationTaskOptions {
     // mode makes do with the cheaper wifi/cell fix.
     accuracy: quick ? Location.Accuracy.High : Location.Accuracy.Balanced,
     // Android: a strict minimum interval between updates. iOS ignores this
-    // (it's documented as Android-only) -- see deferredUpdatesInterval and
-    // the gap checks in maybeSend for how iOS cadence is handled.
+    // (it's documented as Android-only); there the distance filter keeps a
+    // still phone from getting a fix every second, and the gap checks in
+    // maybeSend enforce the cadence.
     timeInterval: interval,
-    distanceInterval: 0,
-    // iOS, background only: ask the OS to batch updates and hand them over
-    // no more than once per interval. Best-effort; maybeSend enforces the
-    // cadence itself regardless.
-    deferredUpdatesInterval: interval,
+    distanceInterval: !quick && Platform.OS === 'ios' ? NORMAL_DISTANCE_METRES_IOS : 0,
+    // Background only: expo-location holds fixes in memory and runs the task
+    // once per interval, so iOS doesn't wake JS for every fix. Android is
+    // left at 0: it already spaces fixes by timeInterval, and holding them
+    // back too could push a fix arriving at 4:59.8 out to the 10-minute
+    // mark.
+    deferredUpdatesInterval: Platform.OS === 'ios' ? interval : 0,
     deferredUpdatesDistance: 0,
     activityType: Location.ActivityType.Other,
     pausesUpdatesAutomatically: false,
@@ -214,6 +238,7 @@ export async function startSharing(): Promise<void> {
 
 export async function stopSharing(): Promise<void> {
   await clearQuickUntil();
+  knownQuickUntil = 0;
   if (await isSharing()) {
     await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
   }
@@ -226,6 +251,7 @@ export async function stopSharing(): Promise<void> {
 export async function startQuickUpdates(durationMs: number): Promise<number> {
   const until = Date.now() + durationMs;
   await saveQuickUntil(until);
+  knownQuickUntil = until;
   await applyMode('quick');
   return until;
 }
@@ -233,5 +259,6 @@ export async function startQuickUpdates(durationMs: number): Promise<number> {
 // Back to normal updates; sharing stays on.
 export async function stopQuickUpdates(): Promise<void> {
   await clearQuickUntil();
+  knownQuickUntil = 0;
   if (await isSharing()) await applyMode('normal');
 }

@@ -13,6 +13,16 @@ export const UPDATE_INTERVAL_MS = 5 * 60 * 1000;
 // arriving at 4:59.8 isn't dropped and pushed out to the 10-minute mark.
 export const MIN_SEND_GAP_MS = UPDATE_INTERVAL_MS - 2 * 1000;
 
+// iOS, normal mode: only hand over a new fix once the phone has moved this
+// far. iOS has no "one fix every 5 minutes" setting (timeInterval is
+// Android-only), so with no distance filter it delivers about one a second
+// around the clock, which is most of the normal-mode battery drain. With the
+// filter a phone sitting still gets no fixes at all and the heartbeat below
+// fetches one every 5 minutes instead. Android keeps 0: its own 5-minute
+// interval already spaces the fixes, and a filter there would only swap the
+// OS's fix for the heartbeat's.
+export const NORMAL_DISTANCE_METRES_IOS = 50;
+
 // If nothing has been posted for this long while sharing, the app fetches a
 // position itself and posts it, even if the OS hasn't delivered one (iOS
 // often stops delivering when the phone sits still). The point is an
