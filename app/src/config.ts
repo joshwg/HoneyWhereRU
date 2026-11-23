@@ -57,6 +57,16 @@ export const QUICK_DURATIONS = [
   { label: '4 hours', ms: 4 * 60 * 60 * 1000 },
 ] as const;
 
+// The longest quick updates can run, and the hard limit on the OS staying on
+// quick-update settings (2-second GPS) for any reason: a duration is clamped
+// to this, a stored end time further out than this is treated as expired,
+// and if the OS is still on quick settings this long (plus
+// QUICK_LIMIT_GRACE_MS) after they went on, the background side forces it
+// back to normal, pausing sharing as a last resort.
+export const QUICK_MAX_MS = 4 * 60 * 60 * 1000;
+// Lets the ordinary end-of-quick switch at exactly 4 hours go first.
+export const QUICK_LIMIT_GRACE_MS = 60 * 1000;
+
 // What a plain tap on "Quick update" starts; the ▾ menu offers the rest.
 export const QUICK_DEFAULT_MS = 30 * 60 * 1000;
 
@@ -74,6 +84,34 @@ export const QUICK_POLL_INTERVAL_MS = 5 * 1000;
 // until the OS kills it.
 export const REQUEST_TIMEOUT_MS = 15 * 1000;
 
+// One background send (fix lookup + post) normally finishes well inside a
+// minute: every step that can wait has its own REQUEST_TIMEOUT_MS. If one is
+// still marked as running after this long, something hung without ever
+// settling, and the next tick stops waiting for it rather than skipping its
+// turn forever.
+export const IN_FLIGHT_STALE_MS = 90 * 1000;
+
+// After a failed send the next try waits RETRY_BASE_MS, doubling with each
+// further failure up to RETRY_MAX_MS (QUICK_MAX_GAP_MS during quick
+// updates), and goes back to normal after the first success. Each try uses a
+// fresh fix, so nothing is lost by not replaying the failed one; the point is
+// not to spin a fix lookup and a request every 5 seconds for hours while the
+// phone is offline, yet still catch the network coming back within a minute.
+export const RETRY_BASE_MS = 5 * 1000;
+export const RETRY_MAX_MS = 60 * 1000;
+
+// When quick updates end in the background, switching the OS back to normal
+// settings means restarting the location service, which Android 12+ may
+// refuse or never answer from the background. Sends carry on regardless;
+// the switch is retried this often until it works (opening the app always
+// does it).
+export const OS_SWITCH_RETRY_MS = 5 * 60 * 1000;
+
+// The background status record is written at most this often for routine
+// news (a fix arrived, another post succeeded); a change from success to
+// failure or back, or a new error message, is written straight away.
+export const BG_STATUS_SAVE_GAP_MS = 60 * 1000;
+
 // Must match minTokenLen / maxTokenLen in server/main.go.
 export const TOKEN_MIN_LEN = 12;
 export const TOKEN_MAX_LEN = 48;
@@ -88,4 +126,12 @@ export const STORAGE_KEYS = {
   lastSentPos: 'whereru:lastSentPos',
   // Quick updates run until this time (ms since epoch); absent when off.
   quickUntil: 'whereru:quickUntil',
+  // What the background side has been doing (BgStatus in storage.ts), so the
+  // app can show why updates stopped.
+  bgStatus: 'whereru:bgStatus',
+  // When the OS was put on quick-update settings (ms since epoch); absent
+  // once it's back on normal ones. Drives the QUICK_MAX_MS backstop.
+  osQuickSince: 'whereru:osQuickSince',
+  // Set when the backstop had to pause sharing; opening the app resumes it.
+  resumeSharing: 'whereru:resumeSharing',
 } as const;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 import { Linking, StyleSheet, View } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 
@@ -6,8 +6,20 @@ import type { PersonLocation } from './api';
 
 export type MapPerson = PersonLocation & { label: string; isYou: boolean };
 
+// What the app can ask the map to do. A person is named by mapId().
+export type PeopleMapHandle = {
+  focus: (id: string) => void;
+  showEveryone: () => void;
+};
+
+// Stable id for a person on the map: you, or another person by name (names
+// are unique per server).
+export function mapId(p: { name: string; isYou: boolean }): string {
+  return p.isYou ? 'you' : `p:${p.name}`;
+}
+
 // Leaflet + OpenStreetMap tiles inside a WebView: no API key needed. The page
-// exposes window.setPeople(); markers post a message back when tapped.
+// exposes window.setPeople(), window.focusPerson() and window.showEveryone().
 //
 // The Leaflet tags carry Subresource Integrity hashes (sha384 of the 1.9.4
 // dist files) so a tampered CDN response is refused rather than executed.
@@ -54,10 +66,47 @@ const MAP_HTML = `<!DOCTYPE html>
 
   var layer = L.layerGroup().addTo(map);
   var bounds = null;
+  var people = [];
   var fitted = false;
-  // With exactly one other person the map follows them: the "lat,lng" we
-  // last centred on, so a redraw that didn't move them doesn't touch the view.
-  var followed = null;
+  // The person the map follows (their id), or null when it's showing
+  // everyone. Until the user picks (a person, or "show everyone"), a group
+  // with exactly one other person follows them by default.
+  var follow = null;
+  var userChose = false;
+  // The "lat,lng" we last centred the followed person on, so a redraw that
+  // didn't move them doesn't touch the view.
+  var followedAt = null;
+
+  function find(id) {
+    for (var i = 0; i < people.length; i++) if (people[i].id === id) return people[i];
+    return null;
+  }
+
+  // Centre on the followed person if they've moved since we last did. The
+  // first time zooms in; after that the user's zoom is kept.
+  function centreOnFollowed(force) {
+    var p = follow && find(follow);
+    if (!p) return false;
+    var key = p.lat + ',' + p.lng;
+    if (!force && key === followedAt) return true;
+    followedAt = key;
+    map.setView([p.lat, p.lng], force || !fitted ? 15 : map.getZoom());
+    fitted = true;
+    return true;
+  }
+
+  window.focusPerson = function (id) {
+    userChose = true;
+    follow = id;
+    centreOnFollowed(true);
+  };
+
+  window.showEveryone = function () {
+    userChose = true;
+    follow = null;
+    followedAt = null;
+    fitAll();
+  };
 
   function fitAll() {
     if (!bounds) return;
@@ -74,13 +123,14 @@ const MAP_HTML = `<!DOCTYPE html>
       var div = L.DomUtil.create('div', 'leaflet-bar fit');
       div.innerHTML = '&#8982;';
       div.title = 'Show everyone';
-      L.DomEvent.on(div, 'click', function (e) { L.DomEvent.stop(e); fitAll(); });
+      L.DomEvent.on(div, 'click', function (e) { L.DomEvent.stop(e); window.showEveryone(); });
       return div;
     }
   });
   map.addControl(new FitControl());
 
-  window.setPeople = function (people) {
+  window.setPeople = function (list) {
+    people = list;
     layer.clearLayers();
     bounds = null;
     people.forEach(function (p) {
@@ -91,26 +141,18 @@ const MAP_HTML = `<!DOCTYPE html>
       }
       L.circleMarker(ll, { radius: 8, color: '#fff', weight: 2, fillColor: color, fillOpacity: 1 })
         .bindTooltip(escapeHtml(p.label), { permanent: true, direction: 'top', offset: [0, -8] })
-        .on('click', function () { post({ type: 'person', lat: p.lat, lng: p.lng }); })
+        .on('click', function () { window.focusPerson(p.id); })
         .addTo(layer);
       bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
     });
-    var others = people.filter(function (p) { return !p.isYou; });
-    if (others.length === 1) {
-      // Two-person mode: keep the other person centred. Re-centre whenever
-      // their position changes; keep whatever zoom the user has chosen.
-      var o = others[0];
-      var key = o.lat + ',' + o.lng;
-      if (key !== followed) {
-        followed = key;
-        map.setView([o.lat, o.lng], fitted ? map.getZoom() : 15);
-        fitted = true;
-      }
-      return;
+    if (!userChose) {
+      // Two-person mode: follow the other person by default.
+      var others = people.filter(function (p) { return !p.isYou; });
+      follow = others.length === 1 ? others[0].id : null;
     }
-    followed = null;
-    // Group mode: only auto-frame once, so a background refresh doesn't yank
-    // the view away from wherever the user has panned to.
+    if (centreOnFollowed(false)) return;
+    // Showing everyone: only auto-frame once, so a background refresh doesn't
+    // yank the view away from wherever the user has panned to.
     if (!fitted && bounds) { fitAll(); fitted = true; }
   };
 
@@ -128,20 +170,35 @@ function isWebUrl(url: string): boolean {
 export function PeopleMap({
   people,
   baseUrl,
-  onPersonPress,
+  ref,
 }: {
   people: MapPerson[];
   // Pages load with this origin so OSM's tile servers see a real Referer.
   baseUrl: string;
-  onPersonPress: (lat: number, lng: number) => void;
+  ref?: Ref<PeopleMapHandle>;
 }) {
   const webRef = useRef<WebView>(null);
   const [ready, setReady] = useState(false);
 
+  // Before the page is ready there's nothing to move; the default framing
+  // applies once it loads.
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: (id: string) => {
+        if (ready) webRef.current?.injectJavaScript(`window.focusPerson(${JSON.stringify(id)}); true;`);
+      },
+      showEveryone: () => {
+        if (ready) webRef.current?.injectJavaScript('window.showEveryone(); true;');
+      },
+    }),
+    [ready]
+  );
+
   useEffect(() => {
     if (!ready) return;
     const payload = people.map(({ name, label, lat, lng, accuracy, isYou }) => ({
-      name,
+      id: mapId({ name, isYou }),
       label,
       lat,
       lng,
@@ -153,7 +210,7 @@ export function PeopleMap({
 
   const onMessage = useCallback(
     (event: WebViewMessageEvent) => {
-      let msg: { type: string; url?: string; lat?: number; lng?: number };
+      let msg: { type: string; url?: string };
       try {
         msg = JSON.parse(event.nativeEvent.data);
       } catch {
@@ -161,10 +218,8 @@ export function PeopleMap({
       }
       if (msg.type === 'ready') setReady(true);
       else if (msg.type === 'open' && msg.url && isWebUrl(msg.url)) Linking.openURL(msg.url);
-      else if (msg.type === 'person' && typeof msg.lat === 'number' && typeof msg.lng === 'number')
-        onPersonPress(msg.lat, msg.lng);
     },
-    [onPersonPress]
+    []
   );
 
   return (

@@ -18,10 +18,27 @@ import * as Location from 'expo-location';
 
 import { fetchLocations, locationToPayload, normalizeUrl, postLocation, type PersonLocation } from './src/api';
 import { formatRelativeTime, formatSpeedSuffix } from './src/formatTime';
-import { isSharing, startQuickUpdates, startSharing, stopQuickUpdates, stopSharing } from './src/locationTask';
-import { clearProfile, loadProfile, loadQuickUntil, saveLastSent, saveProfile, type Profile } from './src/storage';
+import {
+  ensureSharingRunning,
+  isSharing,
+  startQuickUpdates,
+  startSharing,
+  stopQuickUpdates,
+  stopSharing,
+} from './src/locationTask';
+import {
+  clearProfile,
+  EMPTY_BG_STATUS,
+  loadBgStatus,
+  loadProfile,
+  loadQuickUntil,
+  saveLastSent,
+  saveProfile,
+  type BgStatus,
+  type Profile,
+} from './src/storage';
 import { POLL_INTERVAL_MS, QUICK_DEFAULT_MS, QUICK_POLL_INTERVAL_MS, QUICK_DURATIONS, TOKEN_MAX_LEN, TOKEN_MIN_LEN } from './src/config';
-import { PeopleMap, type MapPerson } from './src/PeopleMap';
+import { mapId, PeopleMap, type MapPerson, type PeopleMapHandle } from './src/PeopleMap';
 
 export default function App() {
   return (
@@ -262,12 +279,18 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
   // storage on every clock tick rather than trusted.
   const [quickUntil, setQuickUntil] = useState(0);
   const [quickMenuOpen, setQuickMenuOpen] = useState(false);
+  // What the background side last did, shown under "You" so a phone that
+  // has stopped updating says why.
+  const [bg, setBg] = useState<BgStatus>(EMPTY_BG_STATUS);
   // Android draws edge-to-edge, so the scroll content needs room for the
   // navigation bar or the last button sits underneath it.
   const insets = useSafeAreaInsets();
   // Polls can overlap (timer + "send now"); only the newest response wins so
   // a slow earlier reply can't overwrite fresher data.
   const latestRequest = useRef(0);
+  // Tapping a card centres the map above on that person.
+  const mapRef = useRef<PeopleMapHandle>(null);
+  const focusOnMap = useCallback((p: { name: string; isYou: boolean }) => mapRef.current?.focus(mapId(p)), []);
 
   const refresh = useCallback(async () => {
     const id = ++latestRequest.current;
@@ -291,7 +314,19 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
       loadQuickUntil().then((v) => {
         if (active) setQuickUntil(v);
       });
+      loadBgStatus().then((v) => {
+        if (active) setBg(v);
+      });
     };
+    // Restart background updates in case the OS stopped them while the app
+    // was away (see ensureSharingRunning).
+    // It can also turn sharing back on, so the switch is re-read after.
+    const heal = () => {
+      ensureSharingRunning()
+        .catch((err) => console.warn('Could not restart location updates:', err))
+        .finally(syncState);
+    };
+    heal();
     syncState();
     refresh();
 
@@ -303,6 +338,7 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     // it comes back rather than showing stale positions until the next tick.
     const appState = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
+        heal();
         setNow(Date.now());
         syncState();
         refresh();
@@ -420,7 +456,10 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Honey Where Are You?</Text>
-        <PeopleMap people={mapPeople} baseUrl={profile.serverUrl} onPersonPress={openInMaps} />
+        <PeopleMap ref={mapRef} people={mapPeople} baseUrl={profile.serverUrl} />
+        <Pressable style={styles.showEveryone} onPress={() => mapRef.current?.showEveryone()}>
+          <Text style={styles.linkButtonText}>Show everyone</Text>
+        </Pressable>
       </View>
 
       <ScrollView
@@ -512,7 +551,8 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
               quick={person.quick}
               body={`Last seen ${formatRelativeTime(person.updatedAt, now)}${formatSpeedSuffix(person.speedMph)}`}
               spaced
-              onPress={() => openInMaps(person.lat, person.lng)}
+              onPress={() => focusOnMap({ name: person.name, isYou: false })}
+              onOpenMaps={() => openInMaps(person.lat, person.lng)}
             />
           ))
         ) : (
@@ -527,11 +567,13 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
             body={`${you.lat.toFixed(5)}, ${you.lng.toFixed(5)}${
               you.accuracy != null ? ` (±${Math.round(you.accuracy)} m)` : ''
             }`}
-            onPress={() => openInMaps(you.lat, you.lng)}
+            onPress={() => focusOnMap({ name: you.name, isYou: true })}
+            onOpenMaps={() => openInMaps(you.lat, you.lng)}
           />
         ) : (
           <Text style={styles.hint}>You haven't sent a location yet.</Text>
         )}
+        {sharing && <BgStatusLines status={bg} now={now} />}
 
         <Pressable style={styles.signOut} onPress={onEdit}>
           <Text style={styles.signOutText}>Change server URL or token</Text>
@@ -543,36 +585,88 @@ function MainScreen({ profile, onEdit }: { profile: Profile; onEdit: () => void 
   );
 }
 
+// A few plain lines about the background sender on this phone, for working
+// out why updates stopped: whether it's still trying, whether the OS is still
+// delivering locations, and whether the app has been restarted.
+function BgStatusLines({ status: s, now }: { status: BgStatus; now: number }) {
+  const lines: { text: string; bad?: boolean }[] = [];
+  lines.push(
+    s.attemptAt
+      ? { text: `Last background send ${formatRelativeTime(s.attemptAt, now)}: ${s.ok ? 'OK' : 'failed'}`, bad: !s.ok }
+      : { text: 'No background send yet' }
+  );
+  // Show the last error while sends are failing, and for a day after.
+  if (s.error && (!s.ok || now - s.errorAt < 24 * 60 * 60 * 1000)) {
+    lines.push({ text: `Last error (${formatRelativeTime(s.errorAt, now)}): ${s.error}`, bad: !s.ok });
+  }
+  lines.push({ text: `Last location from the phone: ${s.fixAt ? formatRelativeTime(s.fixAt, now) : 'none yet'}` });
+  if (s.startedAt) lines.push({ text: `App (re)started ${formatRelativeTime(s.startedAt, now)}` });
+  if (s.unstuckCount) {
+    lines.push({
+      text: `Recovered from a stuck send ${s.unstuckCount} time${s.unstuckCount === 1 ? '' : 's'} (last ${formatRelativeTime(s.unstuckAt, now)})`,
+      bad: true,
+    });
+  }
+  return (
+    <View style={styles.bgStatus}>
+      {lines.map((l) => (
+        <Text key={l.text} style={[styles.bgStatusText, l.bad && styles.bgStatusBad]}>
+          {l.text}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
 function PersonCard({
   title,
   body,
   quick,
   spaced,
   onPress,
+  onOpenMaps,
 }: {
   title: string;
   body: string;
   quick?: boolean;
   spaced?: boolean;
-  onPress: () => void;
+  onPress: () => void; // show them on the map above
+  onOpenMaps: () => void; // hand off to the phone's maps app
 }) {
   return (
-    <Pressable style={[styles.card, spaced && styles.cardSpaced]} onPress={onPress}>
-      <View style={styles.cardTitleRow}>
-        <Text style={styles.cardTitle}>{title}</Text>
-        {quick && (
-          <View style={styles.quickBadge}>
-            <Text style={styles.quickBadgeText}>{QUICK_MARK} Quick updates</Text>
-          </View>
-        )}
-      </View>
-      <Text style={styles.cardBody}>{body}</Text>
-      <Text style={styles.cardHint}>Tap to open in Maps</Text>
-    </Pressable>
+    <View style={[styles.card, spaced && styles.cardSpaced]}>
+      <Pressable style={styles.cardMain} onPress={onPress}>
+        <View style={styles.cardTitleRow}>
+          <Text style={styles.cardTitle}>{title}</Text>
+          {quick && (
+            <View style={styles.quickBadge}>
+              <Text style={styles.quickBadgeText}>{QUICK_MARK} Quick updates</Text>
+            </View>
+          )}
+        </View>
+        <Text style={styles.cardBody}>{body}</Text>
+        <Text style={styles.cardHint}>Tap to show on the map</Text>
+      </Pressable>
+      <Pressable style={styles.mapsButton} onPress={onOpenMaps} hitSlop={8} accessibilityLabel="Open in Maps">
+        <Text style={styles.mapsButtonIcon}>🗺️</Text>
+        <Text style={styles.mapsButtonText}>Maps</Text>
+      </Pressable>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  bgStatus: {
+    marginTop: 10,
+  },
+  bgStatusText: {
+    fontSize: 12,
+    color: '#888',
+    lineHeight: 17,
+  },
+  bgStatusBad: {
+    color: '#b3261e',
+  },
   container: {
     flex: 1,
     backgroundColor: '#fff',
@@ -769,7 +863,36 @@ const styles = StyleSheet.create({
   card: {
     backgroundColor: '#f5f7fb',
     borderRadius: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  cardMain: {
+    flex: 1,
     padding: 16,
+  },
+  mapsButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    backgroundColor: '#fff',
+  },
+  mapsButtonIcon: {
+    fontSize: 20,
+  },
+  mapsButtonText: {
+    fontSize: 11,
+    color: '#2563eb',
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  showEveryone: {
+    alignSelf: 'flex-end',
+    paddingVertical: 8,
   },
   cardSpaced: {
     marginBottom: 10,
