@@ -1,4 +1,4 @@
-import { Platform } from 'react-native';
+import { AppState, Platform } from 'react-native';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import {
@@ -6,6 +6,8 @@ import {
   HEARTBEAT_GAP_MS,
   HEARTBEAT_TICK_MS,
   BG_STATUS_SAVE_GAP_MS,
+  FOREGROUND_START_RETRIES,
+  FOREGROUND_START_RETRY_MS,
   IN_FLIGHT_STALE_MS,
   LOCATION_TASK_NAME,
   MIN_SEND_GAP_MS,
@@ -333,7 +335,7 @@ async function enforceQuickLimit(mode: Mode, now: number): Promise<boolean> {
     knownQuickUntil = 0;
   }
   try {
-    await withTimeout(applyMode('normal'), REQUEST_TIMEOUT_MS);
+    await withTimeout(applyMode('normal', true), REQUEST_TIMEOUT_MS);
     return true;
   } catch (err) {
     console.warn('[locationTask] could not switch to normal; pausing sharing:', err);
@@ -362,7 +364,7 @@ async function enforceQuickLimit(mode: Mode, now: number): Promise<boolean> {
 function switchOsModeInBackground(mode: Mode, now: number): void {
   if (now - osSwitchTriedAt < OS_SWITCH_RETRY_MS) return;
   osSwitchTriedAt = now;
-  withTimeout(applyMode(mode), REQUEST_TIMEOUT_MS).catch((err) => {
+  withTimeout(applyMode(mode, true), REQUEST_TIMEOUT_MS).catch((err) => {
     const message = `Could not switch location updates to ${mode} in the background (${
       err instanceof Error ? err.message : String(err)
     }); opening the app will`;
@@ -420,18 +422,68 @@ function taskOptions(mode: Mode): Location.LocationTaskOptions {
 // the GPS settings while the service and its notification carry on. The
 // notification keeps its old text until the app is opened, when
 // ensureSharingRunning applies the full options again.
-async function applyMode(mode: Mode): Promise<void> {
+//
+// Only background callers get the retry, and only for that specific
+// refusal. A start without `foregroundService` made while expo-location
+// thinks the app is open stops the running service (it reads it as "no
+// service wanted"), so the retry must never run from the foreground.
+// Background callers have already checked that sharing is on, so it isn't
+// checked again here: the 1.2.1 build did, the check came back false in the
+// background, and the phone was left on quick settings until it was opened.
+async function applyMode(mode: Mode, fromBackground = false): Promise<void> {
   const options = taskOptions(mode);
   try {
     await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, options);
   } catch (err) {
-    if (Platform.OS !== 'android' || !(await isSharing())) throw err;
+    if (Platform.OS !== 'android' || !fromBackground || !isBackgroundStartRefusal(err)) throw err;
     const { foregroundService: _, ...withoutService } = options;
-    await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, withoutService);
+    try {
+      await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, withoutService);
+    } catch (retryErr) {
+      const why = retryErr instanceof Error ? retryErr.message : String(retryErr);
+      throw new Error(`the retry without the foreground service failed too: ${why}`);
+    }
   }
   osSwitchTriedAt = 0; // a later switch shouldn't wait on an old try's retry gap
   if (mode === 'normal') await setOsQuickSince(0);
   else if (!(await osQuickSince())) await setOsQuickSince(Date.now());
+}
+
+// expo-location's ForegroundServiceStartNotAllowedException: it decides
+// "background" from its own flag, set when the activity resumes, not from
+// what the screen shows.
+function isBackgroundStartRefusal(err: unknown): boolean {
+  const e = err as { code?: string; message?: string } | null;
+  return (
+    e?.code === 'ERR_FOREGROUND_SERVICE_START_NOT_ALLOWED' ||
+    (e?.message ?? '').includes('cannot be started when the application is in the background')
+  );
+}
+
+// applyMode for calls made with the app open (opening it, the switch, the
+// quick button). Right as the app comes back, or as it's being left,
+// expo-location's foreground flag can disagree with AppState for a moment,
+// and the start is refused. Give it a few short retries while AppState still
+// says the app is open; once it isn't, the refusal is real and passed on.
+async function applyModeInForeground(mode: Mode): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await applyMode(mode);
+    } catch (err) {
+      if (
+        Platform.OS !== 'android' ||
+        !isBackgroundStartRefusal(err) ||
+        attempt >= FOREGROUND_START_RETRIES ||
+        AppState.currentState !== 'active'
+      ) {
+        if (isBackgroundStartRefusal(err)) {
+          throw new Error('Android only lets location sharing start while the app is open on screen. Open the app and try again.');
+        }
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, FOREGROUND_START_RETRY_MS));
+    }
+  }
 }
 
 export async function isSharing(): Promise<boolean> {
@@ -440,7 +492,7 @@ export async function isSharing(): Promise<boolean> {
 
 export async function startSharing(): Promise<void> {
   if (await isSharing()) return;
-  await applyMode(await currentMode(Date.now()));
+  await applyModeInForeground(await currentMode(Date.now()));
 }
 
 // Called whenever the app comes to the foreground. If sharing is on, restart
@@ -458,7 +510,7 @@ export async function ensureSharingRunning(): Promise<void> {
     await saveResumeSharing(false);
   }
   retryAt = 0;
-  await applyMode(await currentMode(Date.now()));
+  await applyModeInForeground(await currentMode(Date.now()));
   maybeSend(null);
 }
 
@@ -484,7 +536,7 @@ export async function startQuickUpdates(durationMs: number): Promise<number> {
   await saveQuickUntil(until);
   knownQuickUntil = until;
   await saveResumeSharing(false);
-  await applyMode('quick');
+  await applyModeInForeground('quick');
   await setOsQuickSince(now);
   return until;
 }
@@ -493,5 +545,5 @@ export async function startQuickUpdates(durationMs: number): Promise<number> {
 export async function stopQuickUpdates(): Promise<void> {
   await clearQuickUntil();
   knownQuickUntil = 0;
-  if (await isSharing()) await applyMode('normal');
+  if (await isSharing()) await applyModeInForeground('normal');
 }

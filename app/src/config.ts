@@ -107,6 +107,13 @@ export const RETRY_MAX_MS = 60 * 1000;
 // does it).
 export const OS_SWITCH_RETRY_MS = 5 * 60 * 1000;
 
+// Starting location updates with the app open can be refused for a moment
+// right as it comes back to the screen (expo-location hasn't seen the
+// activity resume yet). Retried this many times, this far apart, while the
+// app is still open.
+export const FOREGROUND_START_RETRIES = 3;
+export const FOREGROUND_START_RETRY_MS = 1000;
+
 // The background status record is written at most this often for routine
 // news (a fix arrived, another post succeeded); a change from success to
 // failure or back, or a new error message, is written straight away.
